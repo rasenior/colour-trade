@@ -1,0 +1,93 @@
+
+```{r setup, include=FALSE, echo=FALSE}
+library(knitr)
+opts_knit$set(root.dir = "../")
+```
+
+```{r other-setup}
+library(dplyr)
+library(tidyr)
+library(phytools)
+
+spp_colour <- readRDS(file = "data/sorted/summarise-colour/spp_colour.Rds")
+spp_colour_sub <- readRDS(file = "data/sorted/summarise-colour/spp_colour_sub.Rds")
+birdtree <- readRDS("data/sorted/phylo/phylo.Rds")
+```
+
+```{r sort}
+# Sort full dataset by patch > hue > saturation > value
+spp_colour <-
+  spp_colour %>% 
+  arrange(patch, hue, saturation, value)
+
+# Unique species/coordinates (summarised across patches)
+spp_colour_main <-
+  spp_colour %>% 
+  mutate(
+    # Make species name match phylogeny
+    species = gsub("[.]", "_", species),
+    # Relevel threat level (extinct & data deficient -> NA)
+    iucn = 
+      factor(iucn,
+             levels = c("LC", "NT", "VU", "EN", "CR")),
+    threatened = 
+        replace_na(
+      as.numeric(paste(
+      factor(iucn,
+               levels = c("LC", "NT", "VU", "EN", "CR"),
+             labels = c(rep(0,2), rep(1,3))))),
+      0),
+    # Recode trade
+    traded = 
+      replace_na(
+      as.numeric(paste(
+        factor(SiTDB_trade_interest,
+               levels = c("evidence", "possible"),
+               labels = c(1,0)))), 
+      0),
+    SiTDB_domestic_trade =
+      as.numeric(paste(
+        factor(replace_na(SiTDB_domestic_trade, "no"),
+               levels = c("no", "yes"),
+               labels = c(0,1)))),
+    SiTDB_international_trade =
+      as.numeric(paste(
+        factor(replace_na(SiTDB_international_trade, "no"),
+               levels = c("no", "yes"),
+               labels = c(0,1)))),
+    SiTDB_wild_caught =
+      as.numeric(paste(
+        factor(replace_na(SiTDB_primary_source, "no"),
+               levels = c("wild caught","no", "captive", "unknown"),
+               labels = c(1,0,0,0))))
+      ) %>% 
+  filter(
+    # Choose crown patch for displaying hex (for pretty figures)
+    patch == "crown" &
+      !(is.na(traded)) & 
+      !(is.na(iucn)) &
+      !(is.na(CU_c_spMax)) &
+      species %in% birdtree$tip.label) %>% 
+  # Match order to phylogeny
+  mutate(species = factor(species,
+                          levels = birdtree$tip.label)) %>% 
+  # Order by species
+  arrange(species) %>% 
+  # Remove patch-level variables
+  dplyr::select(-c(patch,
+                   Female_plumage_score, Male_plumage_score))
+
+# Sort phylogeny
+keep.spp <- unique(spp_colour_main$species)
+birdtree <- drop.tip(birdtree, 
+                     birdtree$tip.label[-match(keep.spp, birdtree$tip.label)])
+
+setdiff(birdtree$tip.label,spp_colour_main$species)
+all(spp_colour_main$species == birdtree$tip.label)
+row.names(spp_colour_main) <- spp_colour_main$species
+```
+
+```{r write}
+save(birdtree, spp_colour, spp_colour_main, 
+     file = "data/sorted/prep-for-analyses/analysis_data.Rdata")
+```

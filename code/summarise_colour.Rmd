@@ -1,0 +1,796 @@
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE)
+
+# Data wrangling
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(pbapply)
+# Parallelisation
+library(parallel)
+library(doParallel)
+ncores <- detectCores()
+# Spatial
+library(sp)
+# Functions to calculate various aspects of colour diversity
+source("code/colour_diversity.R")
+
+# Define coordinate projections
+# Cylindrical equal area
+equal_area = "+proj=cea +lon_0=0 +lat_ts=0 +x_0=0 +y_0=0 +ellps=WGS84 +units=m +no_defs"
+# WGS84
+wgs84 = '+proj=longlat +datum=WGS84'
+```
+
+```{r fns}
+# https://ux.stackexchange.com/questions/82056/how-to-measure-the-contrast-between-any-given-color-and-white
+# https://www.w3.org/TR/2008/REC-WCAG20-20081211/#relativeluminancedef
+# https://www.w3.org/TR/2008/REC-WCAG20-20081211/#contrast-ratiodef
+
+# Luminance
+luminance <- function(R,G,B){
+    # Transform RGB
+    Rg <- ifelse(R <= 10, R/3294, (R/269 + 0.0513)^2.4)
+    Gg <- ifelse(G <= 10, G/3294, (G/269 + 0.0513)^2.4)
+    Bg <- ifelse(B <= 10, B/3294, (B/269 + 0.0513)^2.4)
+    
+    # Calculate luminance
+    L <- 0.2126 * Rg + 0.7152 * Gg + 0.0722 * Bg
+    return(L)
+}
+
+# Root Mean Square
+rms <- function(lums) {
+    mean_lum <- mean(lums)
+    result <- sqrt((1 / length(lums)) * sum(lums ^ 2))
+    return(result)
+}
+
+# Contrast Ratio
+cr <- function(La, Lb){
+    L1 <- max(La, Lb)
+    L2 <- min(La, Lb)
+    CR <- (L1 + 0.05) / (L2 + 0.05)
+    return(CR)
+}
+```
+
+
+```{r sort-data}
+# Load data -------------------------------------------------------------
+# Colour data
+spp_colour <- 
+  readRDS("data/raw/colour_sorted.Rds") %>% 
+  filter(
+    # Choose the more colourful sex of each species
+    sex == colourful_sex
+  )
+# Environmental variables
+load("data/raw/geodat.Rdata")
+
+# Make row names the coordinates
+row.names(occ) <- paste(xy[,1], xy[,2], sep = "_")
+
+# Match range & trait data -----------------------------------------------------
+
+length(unique(spp_colour$species))
+# [1] 5831
+length(which(unique(spp_colour$species) %in% names(occ)))
+# [1] 5670 - losing 161 species here with no range data
+
+# Restrict trait data to species for which we have range data
+spp_colour_sub <- filter(spp_colour, species %in% names(occ))
+# Restrict range data to species for which we have trait data
+occ <- select(occ, spp_colour_sub$species)
+# Sanity check
+nrow(spp_colour_sub[!(duplicated(spp_colour_sub$species)),]) == ncol(occ)
+
+# Restrict to cells (rows) where at least one of the species (columns) is 
+# present (value of 1)
+occ <- occ[which(rowSums(occ) > 0),]
+
+# Restrict to species (columns) that are present (value of 1) in at least one 
+# cell (rows)
+occ <- occ[,which(colSums(occ) > 0)]
+
+# Drop species from trait data that now have missing range data
+length(which(unique(spp_colour_sub$species) %in% names(occ)))
+# [1] 5358 - losing another 312 here that no longer have range data
+spp_colour_sub <- filter(spp_colour_sub, species %in% names(occ))
+
+# Sanity check
+nrow(spp_colour_sub[!(duplicated(spp_colour_sub$species)),]) == ncol(occ)
+
+# Subset to one patch for species' constants
+spInfo <- filter(spp_colour_sub, patch == "crown")
+patches <- levels(spp_colour$patch)
+current_species <- spInfo$species
+```
+
+```{r future-communities}
+# Function to remove given proportion of traded species
+kill_traded <- function(traded_species, killhow, killwhat, n = 100){
+  # If removing a proportion of species
+  if(killhow == "prop") {
+    # Sample desired number of species, weighted by extinction probability
+    rm_spp <- replicate(n, 
+                        sample(traded_species$species, 
+                               size = ceiling(killwhat * traded_n), 
+                               replace = FALSE, 
+                               prob = 1 - (traded_species$extinction_prob)), 
+                        simplify = FALSE)
+    # Identify attributes of these species
+    rm_colour <- lapply(rm_spp, function(x) spInfo[spInfo$species %in% x,])
+    
+    # Create future community by removing the designated species
+    nonrm_spp <- lapply(rm_spp, function(x) spInfo$species[which(!(spInfo$species %in% x))])
+    
+  # If removing by IUCN category
+  } else if(killhow == "iucn") {
+    rm_spp <- traded_species$species[traded_species$iucn %in% killwhat]
+    
+    # Identify attributes of these species
+    rm_colour <- spInfo[spInfo$species %in% rm_spp,]
+    
+    # Create future community by removing the designated species
+    nonrm_spp <- spInfo$species[which(!(spInfo$species %in% rm_spp))]
+  }
+  
+  # Return
+  results <- 
+    list(rm_spp = rm_spp,
+         nonrm_spp = nonrm_spp,
+         rm_colour = rm_colour)
+  return(results)
+}
+
+# Get all traded species
+traded_species <- spInfo[which(spInfo$SiTDB_trade_interest == "evidence"),]
+traded_n <- nrow(traded_species) # 1412
+
+# Define proportions to remove
+props <- seq(1, 0.05, -0.05)
+
+# # Remove each scenario of traded species
+# kill_species_all <- 
+#   lapply(props, function(i) kill_traded(traded_species = traded_species, 
+#                                         killhow = "prop", 
+#                                         killwhat = i, 
+#                                         n = 100))
+# names(kill_species_all) <- paste("prop", props * 100, sep = "")
+# 
+# # Get just the species to remove
+# kill_species <- map(kill_species_all, pluck, 'rm_spp')
+# # Get just the species remaining
+# kill_species_keep <- map(kill_species_all, pluck, 'nonrm_spp')
+# 
+# # Save --------------------------------------------------------------------
+# save(kill_species_all, kill_species, kill_species_keep, 
+#      file = "data/traded_species.Rdata")
+
+load("data/sorted/summarise-colour/traded_species.Rdata")
+```
+
+# Species-level metrics
+
+```{r main-realm}
+# Identify the biogeographic realm in which most of the species' range falls
+sp_realm <- function(sp, range_dat){
+  
+  # Subset range data
+  sp_range <- range_dat[sp]
+  
+  # In which cells (rows) is the species present (value = 1)?
+  cells <- row.names(sp_range)[which(sp_range == 1)]
+  # Which realms do these cells fall in?
+  sp_realms <- envdat$Realm[which(envdat$coords %in% cells)]
+  sp_realms <- table(sp_realms)
+  
+  # Get the realm with the maximum count
+  main_realm <- names(sp_realms[which(sp_realms == max(sp_realms))])
+  
+  # If there is more than one with the same maximum count, pick one randomly
+  if (length(main_realm) > 1) main_realm <- sample(main_realm, size = 1)
+  
+  # Return main realm & range size
+  return(list(main_realm = main_realm, range_size = length(cells)))
+}
+
+spp_realm <- 
+  pblapply(names(occ), function(x) sp_realm(sp = x, range_dat = occ))
+spp_realm <- 
+  plyr::ldply(spp_realm, data.frame) %>% 
+  mutate(species = names(occ))
+
+# Assign to species colour dataframe
+spp_colour <- left_join(spp_colour, spp_realm, by = "species")
+```
+
+```{r patch-uniqueness}
+# Global uniqueness ------------------------------------------------------------
+# - calculate distance of every species to every other species
+# - for each body part separately
+
+#########
+# Current
+#########
+CU_c <-
+  pblapply(patches, function(patch_i){
+    uniqueness(
+      # Current species pool
+      rgb_df = sub_rgb_df(current_species, patch_i, spp_colour),
+      # Nearest 10% of neighbours
+      nbrs_perc = 10)
+  })
+names(CU_c) <- patches
+saveRDS(CU_c, "data/sorted/summarise-colour/patch_uniqueness.Rds")
+
+# Summarise across patches
+CU_c <- 
+    bind_rows(CU_c, .id = "patch") %>% 
+    dplyr::rename(CU_c = uniqueness) %>% 
+    dplyr::group_by(species) %>% 
+    dplyr::summarise(CU_c_spMin = min(CU_c, na.rm = TRUE),
+                     CU_c_spMean = mean(CU_c, na.rm = TRUE),
+                     CU_c_spSD = sd(CU_c, na.rm = TRUE),         
+                     CU_c_spMax = max(CU_c, na.rm = TRUE))
+
+# Merge with colour data -------------------------------------------------------
+spp_colour <- left_join(spp_colour, CU_c, by = c("species"))
+```
+
+```{r colourfulness}
+# ------------------------------------------------------------------------------
+# Summarise which colours are represented across body parts of each species
+# ------------------------------------------------------------------------------
+colourful_cats <- levels(spp_colour$colour_cat)
+colourful_cats <- 
+  colourful_cats[-(which(colourful_cats %in% c("light", "dark", "brown")))]
+
+spp_colourfulness <-
+  spp_colour %>% 
+  # Calculate luminance from RGB
+  mutate(lum = luminance(red, green, blue)) %>% 
+  dplyr::group_by(species) %>% 
+  dplyr::summarise(
+    hue_range = max(hue) - min(hue),
+    # Luminance range (0 to 1)
+    lum_range = max(lum) - min(lum),
+    # Contrast Ratio (1 to 21)
+    CR = cr(max(lum),min(lum)),
+    # Summarise which colours represented by any body part
+    light_patch = any(colour_cat == "light"),
+    dark_patch = any(colour_cat == "dark"),
+    red_patch = any(colour_cat == "red"),
+    brown_patch = any(colour_cat == "brown"),
+    orange_patch = any(colour_cat == "orange"),
+    yellow_patch = any(colour_cat == "yellow"),
+    chartreuse_green_patch = any(colour_cat == "chartreuse_green"),
+    green_patch = any(colour_cat == "green"),
+    spring_green_patch = any(colour_cat == "spring_green"),
+    cyan_patch = any(colour_cat == "cyan"),
+    azure_patch = any(colour_cat == "azure"),
+    blue_patch = any(colour_cat == "blue"),
+    violet_patch = any(colour_cat == "violet"),
+    magenta_patch = any(colour_cat == "magenta"),
+    rose_patch = any(colour_cat == "rose")
+  )
+
+# Assign to species colour dataframe
+spp_colour <- left_join(spp_colour, spp_colourfulness, by = "species")
+```
+
+```{r body-uniqueness}
+spp_body_uniqueness <-
+  pblapply(unique(spp_colour$species), 
+           function(x) hull_overlap(dat = spp_colour, sp = x))
+names(spp_body_uniqueness) <- unique(spp_colour$species)
+spp_body_uniqueness <- 
+  bind_rows(spp_body_uniqueness, .id = "species")
+
+# Assign to species colour dataframe
+spp_colour <- left_join(spp_colour, spp_body_uniqueness, by = "species")
+# Volume of the convex hull of the focal species is pattern diversity
+# Volume of non-overlap is a measure of whole body colour uniqueness
+
+# Which are the most unique species?
+spp_colour[spp_colour$uniqueness_body > 1 & 
+             !(is.na(spp_colour$uniqueness_body)) & 
+             !(duplicated(spp_colour$uniqueness_body)), 
+           "species"]
+```
+
+```{r write-species-data}
+# Add metrics from full dataset to the subset of trait data (which is matched
+# to the occurrence data)
+spp_colour_sub <- 
+  left_join(spp_colour_sub[, c("species", "patch")], 
+            spp_colour, 
+            by = c("species", "patch"))
+# Write
+saveRDS(spp_colour, file = "data/sorted/summarise-colour/spp_colour.Rds")
+saveRDS(spp_colour_sub, file = "data/sorted/summarise-colour/spp_colour_sub.Rds")
+save(envdat, realms, occ, spp_colour, spp_colour_sub,
+     spInfo, patches, current_species,
+     traded_species, kill_species, kill_species_all,
+     file = "data/sorted/summarise-colour/raw_sorted.Rdata")
+```
+
+# Global metrics
+
+```{r colour-diversity}
+
+##########################
+# Colour diversity current
+##########################
+# Get convex hull for all patches on all species of current global species pool
+CD_c_all <- convhulln_ext(spp_colour, trait_vars = c("red", "green", "blue"))
+CD_c_centroid <- CD_c_all$hull_centroid
+CD_c_vertices <- CD_c_all$hull_coords
+
+#########################
+# Colour diversity future
+#########################
+
+# Get convex hull for all patches on all species of future global species pool
+CD_f_all <-
+  # Loop over each kill proportion (20 in total)
+  lapply(kill_species_keep, function(kill_prop) {
+    # Loop over each iteration (100 per kill prop)
+    kill_prop_all <- lapply(kill_prop, function(iter) {
+        convhulln_ext(spp_colour[spp_colour$species %in% iter,], 
+                      trait_vars = c("red", "green", "blue"))})
+    
+    # Grab centroids
+    kill_prop_centroid <- 
+      lapply(kill_prop_all, function(x) x$hull_centroid) %>% 
+      bind_rows() %>% 
+      # Take the mean across all iterations
+      colMeans()
+    
+    # Grab vertices
+    kill_prop_vertices <- lapply(1:length(kill_prop_all), function(i){
+      vertices <- kill_prop_all[[i]]$hull_coords
+      vertices$iter <- i
+      return(vertices)
+    })
+    
+    # Grab hull volume
+    kill_prop_CD <- 
+      lapply(kill_prop_all, function(x) x$hull_vol) %>% 
+      unlist() %>% 
+      # Take the mean across all iterations
+      mean()
+    
+    # Return
+    return(list(centroid_mean = kill_prop_centroid,
+                CD_mean = kill_prop_CD,
+                vertices_list = kill_prop_vertices))
+  })
+
+# Reformat hull volume results (averaged across the 100 iterations of each scenario)
+CD_f <- 
+  lapply(CD_f_all, function(x) x$CD_mean) %>% 
+  bind_rows(.id = "kill_prop") %>% 
+  t()
+CD_f <- data.frame(CD = CD_f,
+                   kill_prop = as.numeric(gsub("prop","",row.names(CD_f))))
+
+# Reformat hull centroid results (averaged across the 100 iterations of each scenario)
+CD_f_centroid <- 
+  lapply(CD_f_all, function(x) x$centroid_mean) %>% 
+  bind_rows(.id = "kill_prop")
+
+# Format vertices
+CD_f_vertices <- 
+  lapply(CD_f_all, function(x) bind_rows(x$vertices_list)) %>% 
+  bind_rows(.id = "kill_prop")
+
+#########
+# Combine
+#########
+
+centroids <- 
+  rbind(CD_f_centroid,
+        data.frame(kill_prop = "prop0", t(CD_c_centroid)))
+vertices <-
+  rbind(CD_f_vertices,
+        data.frame(kill_prop = "prop0", CD_c_vertices, iter = NA))
+
+centroids$id <- (length(kill_species) + 1):1
+kill_id <- centroids$id
+names(kill_id) <- centroids$kill_prop
+vertices$id <- as.numeric(kill_id[match(vertices$kill_prop, names(kill_id))])
+hullpal <- 
+  c('#238b45',
+    grDevices::colorRampPalette(RColorBrewer::brewer.pal(9, "YlOrRd")[3:9])(length(kill_species)))
+names(hullpal) <- unique(vertices$id)
+
+save(
+  hullpal, vertices, centroids,
+  file = "data/sorted/summarise-colour/hull_data.Rdata"
+  )
+```
+
+# Community-level metrics
+
+```{r richness-uniqueness}
+# ------------------------------------------------------------------------------
+# Summarise colours & uniqueness by species in each grid cell
+# ------------------------------------------------------------------------------
+
+# For each grid cell (each row), identify the species that are present,
+# count them (richness), and extract summary colour metrics
+summarise_cell <- function(range_dat, colour_dat){
+  
+  # Identify which species are present in focal cell
+  spp <- names(range_dat)[which(range_dat == 1)]
+  
+  # Subset colour trait data to the species that are present
+  patch_colour_dat <-
+    colour_dat %>%
+    filter(species %in% spp)
+  sp_colour_dat <-
+    patch_colour_dat %>% 
+    filter(!(duplicated(species)))
+  
+  # Summarise across species by patch ----------------------------------------
+  patch_sum <-
+    # Looking at each patch category, across all species present in cell
+    dplyr::group_by(patch_colour_dat, patch) %>%
+    # Results in dataframe with one row for each patch
+    dplyr::summarise(dummy = 1,
+              # Which species?
+              spp = paste(species, collapse = ";"),
+              
+              #### Summarise RGB values for each patch across species
+              # Red
+              red_mean = mean(red),
+              red_sd = sd(red),
+              # Green
+              green_mean = mean(green),
+              green_sd = sd(green),
+              # Blue
+              blue_mean = mean(blue),
+              blue_sd = sd(blue),
+              
+              #### Summarise HSV values for each patch across species
+              # Hue
+              hue_min = min(hue),
+              hue_mean = mean(hue),
+              hue_sd = sd(hue),
+              hue_max = max(hue),
+              # Saturation
+              saturation_min = min(saturation),
+              saturation_mean = mean(saturation),
+              saturation_sd = sd(saturation),
+              saturation_max = max(saturation),
+              # value
+              value_min = min(value),
+              value_mean = mean(value),
+              value_sd = sd(value),
+              value_max = max(value),
+              
+              #### Richness for each patch across species
+              # Total species
+              n = n(),
+              # Number of species with patch of given colour category
+              light_patch_richness = length(which(colour_cat == "light")),
+              dark_patch_richness = length(which(colour_cat == "dark")),
+              red_patch_richness = length(which(colour_cat == "red")),
+              brown_patch_richness = length(which(colour_cat == "brown")),
+              orange_patch_richness = length(which(colour_cat == "orange")),
+              yellow_patch_richness = length(which(colour_cat == "yellow")),
+              chartreuse_green_patch_richness = length(which(colour_cat == "chartreuse_green")),
+              green_patch_richness = length(which(colour_cat == "green")),
+              spring_green_patch_richness = length(which(colour_cat == "spring_green")),
+              cyan_patch_richness = length(which(colour_cat == "cyan")),
+              azure_patch_richness = length(which(colour_cat == "azure")),
+              blue_patch_richness = length(which(colour_cat == "blue")),
+              violet_patch_richness = length(which(colour_cat == "violet")),
+              magenta_patch_richness = length(which(colour_cat == "magenta")),
+              rose_patch_richness = length(which(colour_cat == "rose"))
+    )
+  
+  # Summarise across species -------------------------------------------------
+  
+  # Count species in diff categories
+  N_counts <- 
+    sp_colour_dat %>% 
+    dplyr::summarise(trade_N = length(which(traded == "yes")),
+              tradePet_N = length(which(pet == 1)),
+              tradeProd_N = length(which(prod == 1)),
+              trade_N_juergens = length(which(SiTDB_trade_interest == "evidence")),
+              iucnLC_N = length(which(iucn == "LC")),
+              iucnNT_N = length(which(iucn == "NT")),
+              iucnVU_N = length(which(iucn == "VU")),
+              iucnEN_N = length(which(iucn == "EN")),
+              iucnCR_N = length(which(iucn == "CR")),
+              iucnEW_N = length(which(iucn == "EW")),
+              iucnEX_N = length(which(iucn == "EX")),
+              iucnDD_N = length(which(iucn == "DD")))
+
+  # ------------------------------------------------
+  # Diversity indices using all parts of all species
+  # ------------------------------------------------
+  # this is a measure of the 'evenness' of different colour categories 
+  # represented across patches by the species in this community
+  SHDI_colour <- SHDI(patch_colour_dat$colour_cat)
+  SIDI_colour <- SIDI(patch_colour_dat$colour_cat)
+  
+  # Colour richness across all parts of all species -
+  # this is the number of species in the community that have each colour
+  # represented at least once (any body part)
+  cell_colour_richness <-
+    colSums(select(sp_colour_dat, ends_with("_patch")), 
+            na.rm = TRUE)
+  names(cell_colour_richness) <-
+    gsub("_patch", "_richness", names(cell_colour_richness))
+  
+  # Bind
+  sp_sum <- 
+    cbind(as.data.frame(t(c(dummy = 1,
+                            SHDI_colour = SHDI_colour, SIDI_colour = SIDI_colour, 
+                            cell_colour_richness))),
+          N_counts)
+  
+  # Bind results -------------------------------------------------------------
+  sumdat <- 
+    left_join(patch_sum, sp_sum, by = "dummy") %>% 
+    select(-dummy)
+  
+  # Return summary
+  return(sumdat)
+}
+
+# Apply to every grid cell (row in the occurrence data)
+community_colour <-
+  # Apply function to every row
+  apply(occ, MARGIN = 1, FUN = function(x){
+    tryCatch(
+      {summarise_cell(range_dat = x,colour_dat = spp_colour_sub)},
+      error = function(x){
+        message(x)
+        return(NA)
+      })})
+# Repeat for traded species only
+community_colour_trade <-
+  # Apply function to every row
+  apply(occ, MARGIN = 1, FUN = function(x){
+    tryCatch(
+      {summarise_cell(range_dat = x,
+                      colour_dat = filter(spp_colour_sub, SiTDB_trade_interest == "evidence"))},
+      error = function(x){
+        message(x)
+        return(NA)
+      })})
+
+# Summarise
+community_colour <-
+  community_colour %>%
+  # Bind list to df
+  bind_rows(.id = "coords") %>%
+  # Drop any NAs
+  filter(!(is.na(red_mean)) & !(is.na(green_mean)) & !(is.na(blue_mean))) %>%
+  # Calculate hex of mean RGB
+  mutate(hex = rgb(red_mean / 255,
+                   green_mean / 255,
+                   blue_mean / 255)) %>%
+  # Split coordinates variable
+  separate(coords, into = c("longitude", "latitude"),
+           sep = "_", remove = FALSE, convert = TRUE)
+community_colour_trade <-
+  community_colour_trade %>%
+  # Bind list to df
+  bind_rows(.id = "coords") %>%
+  # Drop any NAs
+  filter(!(is.na(red_mean)) & !(is.na(green_mean)) & !(is.na(blue_mean))) %>%
+  # Calculate hex of mean RGB
+  mutate(hex = rgb(red_mean / 255,
+                   green_mean / 255,
+                   blue_mean / 255)) %>%
+  # Split coordinates variable
+  separate(coords, into = c("longitude", "latitude"),
+           sep = "_", remove = FALSE, convert = TRUE)
+
+# Save
+saveRDS(community_colour, file = "data/sorted/summarise-colour/community_colour.Rds")
+saveRDS(community_colour_trade, file = "data/sorted/summarise-colour/community_colour_trade.Rds")
+```
+
+```{r colour-diversity-current, eval = FALSE}
+
+### NOTE - this takes a fairly long time to run (~ 1.5 hours)
+
+colour_diversity <- NULL
+
+start <- Sys.time()
+for (j in 1:length(patches)) {
+  # Subset colour data to this patch
+  patch_colour_df <- spp_colour_sub[spp_colour_sub$patch == patches[j],]
+
+  # Parallelise
+  cl <- makeCluster(ncores)
+  registerDoParallel(cl)
+  results <-
+    foreach(
+      i = 1:nrow(occ),
+            .combine = 'rbind',
+            .packages = c('geometry', 'purrr'),
+            .errorhandling = 'remove') %dopar% {
+              community_CD(i = i,
+                           occ_matrix = occ,
+                           colour_data = patch_colour_df,
+                           traded_species = unique(traded_species$species),
+                           patch = j,
+                           realms = realms)
+            }
+  stopCluster(cl)
+  colour_diversity <- rbind(colour_diversity, results)
+}
+end <- Sys.time()
+end - start
+saveRDS(colour_diversity, "data/sorted/summarise-colour/colour_diversity_inter.Rds")
+```
+
+```{r colour-diversity-future, eval = FALSE}
+
+### NOTE - this takes a REALLY long time to run (DAYS), better to run on a cluster
+
+start <- Sys.time()
+cl <- makeCluster(ncores)
+registerDoParallel(cl)
+colour_diversity_f <-
+    # First loop is patches
+    # foreach(j = 1:length(patches), .combine='rbind') %:%
+    foreach(j = 1:3, .combine='rbind') %:%
+    # Second is grid cells
+    #### foreach(i = 1:nrow(occ), .combine='rbind') %:%
+    # foreach(i = 1:nrow(occ)) %:%
+    foreach(i = 1:3) %:%
+    # Third is future scenarios
+    # foreach(a = 1:length(kill_species), .combine='rbind') %:%
+    foreach(a = 1:3, .combine='rbind') %:%
+    # Fourth is iterations of future scenario
+    foreach(
+        # b = 1:50,
+        b = 1:3,
+        .combine='rbind',
+        .packages = c('geometry'),
+        .errorhandling = 'remove') %dopar% {
+            community_CD_future(i = i,
+                                patch = patches[j],
+                                kill_species = kill_species,
+                                scenario = a,
+                                iter = b,
+                                occ_matrix = occ,
+                                colour_data = spp_colour_sub[spp_colour_sub$patch == patches[j],])
+        }
+
+stopCluster(cl)
+end <- Sys.time()
+end - start
+
+ # Check for correct dimensions
+good_i <- which(unlist(lapply(colour_diversity_f, ncol)) == 9)
+colour_diversity_f <- do.call("rbind",colour_diversity_f[good_i])
+saveRDS(colour_diversity_f, "data/sorted/summarise-colour/colour_diversity_f_inter.Rds")
+```
+
+```{r sort-colour-diversity}
+# Sort current colour diversity results
+colour_diversity <- 
+    readRDS("data/sorted/summarise-colour/colour_diversity_inter.Rds") %>% 
+    mutate(patch = patches[patch],
+           id = paste(longitude, latitude, patch, sep = "_"))
+
+# Sort future colour diversity results    
+colour_diversity_f <- 
+    readRDS("data/sorted/summarise-colour/colour_diversity_f_inter.Rds") %>% 
+    mutate(id = paste(longitude, latitude, patch, sep = "_"))
+
+length(which(!(colour_diversity$id %in% colour_diversity_f$id)))
+# 450
+length(which(!(colour_diversity_f$id %in% colour_diversity$id)))
+# 12640
+
+# Merge current and future
+colour_diversity <-
+    full_join(colour_diversity, colour_diversity_f, 
+               by = c("longitude","latitude","patch")) %>%
+    dplyr::select(-c("id.x","id.y"))
+
+# Summarise across body patches within each grid cell and kill scenario
+colour_diversity_sum <-
+  colour_diversity %>% 
+  dplyr::group_by(longitude, latitude, kill_prop) %>% 
+  dplyr::summarise(
+    # _______
+    # Current
+    # - COLOUR DIVERSITY
+    # _______
+    # Cell mean colour diversity
+    CD_cellMean = mean(CD_cc, na.rm = TRUE),
+    CD_cellMean_trade = mean(CD_cc_trade, na.rm = TRUE),
+    # Cell mean SES colour diversity (global species pool) 
+    ses_CD_global_cellMean = mean(CD_cc_ses_glb, na.rm = TRUE),
+    # Cell mean SES colour diversity (realm species pool) 
+    ses_CD_realm_cellMean = mean(CD_cc_ses_rlm, na.rm = TRUE),
+    # _______
+    # Current
+    # - COLOUR UNIQUENESS
+    # _______
+    # Cell mean colour uniqueness 
+    CU_cellMean = mean(CU_cc, na.rm = TRUE),
+    CU_cellMean_trade = mean(CU_cc_trade, na.rm = TRUE),
+    # Cell mean SES colour uniqueness (global species pool)
+    ses_CU_global_cellMean = mean(CU_cc_ses_glb, na.rm = TRUE),
+    # Cell mean SES colour uniqueness (realm species pool)
+    ses_CU_realm_cellMean = mean(CU_cc_ses_rlm, na.rm = TRUE),
+    # _______
+    # Current
+    # - PATTERN DIVERSITY & BODY UNIQUENESS
+    # _______
+    # Community current pattern diversity
+    PD_cc_cellMean = mean(PD_cc, na.rm = TRUE),
+    PD_cc_cellMean_trade = mean(PD_cc_trade, na.rm = TRUE),
+    # Community current body uniqueness
+    BU_cc_cellMean = mean(BU_cc, na.rm = TRUE),
+    BU_cc_cellMean_trade = mean(BU_cc_trade, na.rm = TRUE),
+    # ______
+    # Future
+    # - COLOUR DIVERSITY
+    # ______
+    # Cell mean colour diversity loss
+    CD_fc_loss_cellMean = mean(CD_fc_loss, na.rm = TRUE),
+    # Cell mean SES colour diversity loss
+    ses_CD_loss_cellMean = mean(CD_loss_ses, na.rm = TRUE),
+    # ______
+    # Future
+    # - COLOUR UNIQUENESS
+    # ______
+    # Cell mean colour diversity loss
+    CU_fc_loss_cellMean = mean(CU_fc_loss, na.rm = TRUE),
+    # Cell mean SES colour diversity loss
+    ses_CU_loss_cellMean = mean(CU_loss_ses, na.rm = TRUE)
+    )
+
+# Clean up 'Inf' values
+colour_diversity_sum[is.infinite(colour_diversity_sum$ses_CD_loss_cellMean),
+                     "ses_CD_loss_cellMean"] <- NA
+# Merge
+colour_diversity <- 
+  left_join(colour_diversity, colour_diversity_sum, 
+            by = c("longitude", "latitude", "kill_prop"))
+# Write
+saveRDS(colour_diversity, file = "data/sorted/summarise-colour/colour_diversity.Rds")
+```
+
+```{r write}
+community_colour <- readRDS("data/sorted/summarise-colour/community_colour.Rds")
+community_colour_trade <- readRDS("data/sorted/summarise-colour/community_colour_trade.Rds")
+colour_diversity <- readRDS("data/sorted/summarise-colour/colour_diversity.Rds")
+envdat <- readRDS("data/raw/envdat.Rds")
+
+# Combine colour richness/uniqueness data with colour diversity
+community_colour <-
+  left_join(community_colour, colour_diversity, 
+            by = c("longitude", "latitude", "patch"))
+community_colour_trade <-
+  left_join(community_colour_trade, colour_diversity, 
+            by = c("longitude", "latitude", "patch"))
+
+# Combine with environmental data
+community_colour <-
+  left_join(community_colour, select(envdat, -coords), 
+            by = c("longitude", "latitude"))
+community_colour_trade <-
+  left_join(community_colour_trade, select(envdat, -coords), 
+            by = c("longitude", "latitude"))
+
+# Save
+saveRDS(community_colour, file = "data/sorted/summarise-colour/community_colour.Rds")
+saveRDS(community_colour_trade, file = "data/sorted/summarise-colour/community_colour_trade.Rds")
+```
+
