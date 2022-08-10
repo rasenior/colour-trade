@@ -1,0 +1,849 @@
+
+```{r setup}
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+library(ggnewscale)
+library(cowplot)
+library(lme4)
+library(phylolm)
+library(mgcv)
+library(phytools)
+library(caper)
+# Model average colour metric of traded/non-traded species by IUCN category
+library(phyr)
+library(RColorBrewer)
+
+load("data/sorted/prep-for-analyses/analysis_data.Rdata")
+
+# Plotting parameters
+# Define function to capitalise first letter
+capitalise <- function(x) {
+  s <- strsplit(x, " ")[[1]]
+  paste(toupper(substring(s, 1,1)), substring(s, 2),
+        sep = "", collapse = " ")
+}
+text_size = 6
+title_size = 8
+lab_size = 7
+# Load colour palette
+cbpal <- viridis::viridis(4, option = "D")
+pal <- readRDS("data/misc/colourpal_mute.Rds")
+iucnpal <- c("#000000", "#542344", "#d81e05", "#fc7f3f", 
+             "#f9e814","#cce226", "#60c659", "#d1d1c6", "#ffffff")
+names(iucnpal) <- c("EX", "EW", "CR", "EN", "VU", "NT", "LC", "DD", "NE")
+divpal <- RColorBrewer::brewer.pal(11, "RdBu")
+# Sort legend labels
+pal_labs <- 
+  sapply(names(pal), capitalise)
+pal_labs <- gsub("_", " ", pal_labs)
+```
+
+```{r pred-threat-trade-fn}
+# Function to calculate inverse logit
+inv.logit <- function(x){
+  exp(x)/(1 + exp(x))
+}
+
+# Function to calculate critical significance value
+ci.critical <- 
+  function(siglevel) qnorm((100 - siglevel) / 100 / 2, lower.tail = FALSE)
+ci_const = ci.critical(95)
+
+# Function to predict y value from model coefficients
+apply_coef <- function(cc, cc_iucn_i, newdat, xvar, ref_level = FALSE){
+    if (ref_level) {
+        result <- 
+            # Intercept
+            cc[1] + 
+            # Uniqueness
+            cc[2]*newdat[, xvar]
+    }else {
+        result <- 
+            # Intercept
+            cc[1] + 
+            # Uniqueness
+            cc[2]*newdat[, xvar] + 
+            # Threat status
+            cc[cc_iucn_i[1]] + 
+            # Effect of uniqueness given threat status (interaction term)
+            (cc[cc_iucn_i[2]]*newdat[, xvar])
+    }
+    return(result)
+}
+
+pred_phyloGLM <- function(df, xvar, yvar, mod, iucn_level = NA){
+    # All model coefficients
+    cc <- mod$coefficients
+    # Coefficient SD
+    cc_sd <- mod$sd
+    # Bootstrapped confidence intervals
+    bootci_lo <- mod$bootconfint95[1,]
+    bootci_hi <- mod$bootconfint95[2,]
+    
+    # Create newdat
+    newdat <- 
+        data.frame(RV = NA, 
+                   EV = seq(min(df[,xvar]), 
+                            max(df[,xvar]),
+                            length.out = 100),
+                   iucn = iucn_level)
+    names(newdat) <- c(yvar, xvar, "iucn")
+    
+    cc_iucn_i <- grep(paste("iucn", iucn_level, sep = ""), names(cc))
+    ref_level <- ifelse(length(cc_iucn_i) == 0, TRUE, FALSE)
+    
+    # Calculate probability of being traded
+    newdat[,yvar] <- apply_coef(cc, cc_iucn_i, newdat, xvar, ref_level = ref_level)
+    # Standard deviation
+    newdat[,"ci_lo"] <- 
+        apply_coef(cc - (1.96 * cc_sd), cc_iucn_i, newdat, xvar, ref_level = ref_level)
+    newdat[,"ci_hi"] <- 
+        apply_coef(cc + (1.96 * cc_sd), cc_iucn_i, newdat, xvar, ref_level = ref_level)
+    newdat[,"ci_lo_boot"] <- 
+        apply_coef(bootci_lo, cc_iucn_i, newdat, xvar, ref_level = ref_level)
+    newdat[,"ci_hi_boot"] <- 
+        apply_coef(bootci_hi, cc_iucn_i, newdat, xvar, ref_level = ref_level)
+    
+    # Back-transform
+    totrans <- c(yvar, "ci_lo", "ci_hi", "ci_lo_boot", "ci_hi_boot")
+    newdat[totrans] <- inv.logit(newdat[totrans])
+    newdat[,"logis"] <- plogis(cc[1] + cc[xvar]*newdat[,xvar])
+    return(newdat)
+}
+
+# Function to predict pglmm values with CIS
+pred_pglmm <- function(results, x, trade_var) {
+  # Define values of pet trade and IUCN
+  trade_val <- x[trade_var]
+  iucn_val <- x["iucn"]
+  
+  intercept <- results$Value[results$term == "(Intercept)"]
+  intercept_lci <- results$lower.CI[results$term == "(Intercept)"]
+  intercept_uci <- results$upper.CI[results$term == "(Intercept)"]
+  
+  if(trade_val == 1){
+    trade_coef <- results$Value[results$term == trade_var]
+    trade_lci <- results$lower.CI[results$term == trade_var]
+    trade_uci <- results$upper.CI[results$term == trade_var]
+    
+    if(iucn_val == "LC"){
+      iucn_coef <- 0
+      iucn_lci <- 0
+      iucn_uci <- 0
+    } else {
+      iucn_coef <- sum(results$Value[grep(iucn_val,results$term)])
+      iucn_lci <- sum(results$lower.CI[grep(iucn_val,results$term)])
+      iucn_uci <- sum(results$upper.CI[grep(iucn_val,results$term)])
+    }
+  } else {
+    trade_coef <- 0
+    trade_lci <- 0
+    trade_uci <- 0
+    
+    if(iucn_val == "LC"){
+      iucn_coef <- 0
+      iucn_lci <- 0
+      iucn_uci <- 0
+    } else {
+      iucn_coef <- results$Value[grep(paste("^iucn",iucn_val,sep = ""),results$term)] 
+      iucn_lci <- results$lower.CI[grep(paste("^iucn",iucn_val,sep = ""),results$term)] 
+      iucn_uci <- results$upper.CI[grep(paste("^iucn",iucn_val,sep = ""),results$term)] 
+    }
+  }
+  
+  y <- intercept + trade_coef + iucn_coef
+  lower.CI <- intercept_lci + trade_lci + iucn_lci
+  upper.CI <- intercept_uci + trade_uci + iucn_uci
+  return(data.frame(y = y, lower.CI = lower.CI, upper.CI = upper.CI))
+}
+```
+
+```{r phylo-signal, eval = FALSE}
+# Prune the tree
+birdtree <- 
+  drop.tip(birdtree, 
+           birdtree$tip.label[!(birdtree$tip.label %in% 
+                                  spp_colour_main$species)])
+# Match the dataframe
+signal_df <- 
+  spp_colour_main[spp_colour_main$species %in% birdtree$tip.label,] %>% 
+  mutate(
+    threatened = recode(threatened, '0' = "no", '1' = "yes"),
+    # Recode trade
+    traded = recode(threatened, '0' = "no", '1' = "yes"),
+    # Recode pet trade
+    pet = recode(pet, '0' = "no", '1' = "yes"),
+    # Recode prod trade
+    prod = recode(prod, '0' = "no", '1' = "yes")) %>% 
+  dplyr::select(species, threatened, traded, pet, prod, CU_c_spMax)
+row.names(spp_colour_main) <- spp_colour_main$species
+
+# Create comparative data
+signal_df <- 
+  comparative.data(phy = birdtree, 
+                   data = spp_colour_main, 
+                   names.col = species, 
+                   na.omit = FALSE)
+threat_signal <- phylo.d(signal_df, binvar = threatened)
+saveRDS(threat_signal, "data/models/threat_signal.Rds")
+print(threat_signal)
+# Calculation of D statistic for the phylogenetic structure of a binary variable
+# 
+#   Data :  spp_colour_main
+#   Binary variable :  threatened
+#   Counts of states:  0 = 4810
+#                      1 = 456
+#   Phylogeny :  birdtree
+#   Number of permutations :  1000
+# 
+# Estimated D :  0.9495648
+# Probability of E(D) resulting from no (random) phylogenetic structure :  0.001
+# Probability of E(D) resulting from Brownian phylogenetic structure    :  0
+
+# Create comparative data
+trade_signal <- phylo.d(signal_df, binvar = traded)
+saveRDS(trade_signal, "data/models/trade_signal.Rds")
+print(trade_signal)
+# Calculation of D statistic for the phylogenetic structure of a binary variable
+# 
+#   Data :  spp_colour_main
+#   Binary variable :  traded
+#   Counts of states:  0 = 3858
+#                      1 = 1408
+#   Phylogeny :  birdtree
+#   Number of permutations :  1000
+# 
+# Estimated D :  0.6232519
+# Probability of E(D) resulting from no (random) phylogenetic structure :  0
+# Probability of E(D) resulting from Brownian phylogenetic structure    :  0
+
+# Test for phylogenetic signal for colour uniqueness
+unique_signal <-
+  phylosig(tree = birdtree,
+           x = spp_colour_main$CU_c_spMax,
+           method = "lambda",
+           test = TRUE)
+saveRDS(unique_signal, "data/models/unique_signal.Rds")
+unique_signal
+# Phylogenetic signal lambda : 0.594251 
+# logL(lambda) : -23334.8 
+# LR(lambda=0) : 701.874 
+# P-value (based on LR test) : 1.17017e-154 
+
+# Save all
+save(threat_signal, trade_signal, unique_signal, 
+     file = "data/models/phylo_mods.Rdata")
+```
+
+```{r unique-v-threat}
+# Does uniqueness predict prob of being threatened?
+mod1 <-
+  phyloglm(threatened ~ CU_c_spMax,
+           phy = birdtree,
+           data = spp_colour_main,
+           boot = 100,
+           btol = 100)
+saveRDS(mod1, "data/models/threat-unique_mod.Rds")
+mod1_sum <- as.data.frame(summary(mod1)$coefficients)
+saveRDS(mod1_sum, "data/models/threat-unique_mod_sum.Rds")
+```
+
+```{r unique-v-trade}
+# Does uniqueness predict prob of being traded?
+mod2 <-
+  phyloglm(traded ~ CU_c_spMax,
+           phy = birdtree,
+           data = spp_colour_main,
+           boot = 100,
+           btol = 100)
+saveRDS(mod2, "data/models/trade-unique_mod.Rds")
+mod2_sum <- as.data.frame(summary(mod2)$coefficients)
+saveRDS(mod2_sum, "data/models/trade-unique_mod_sum.Rds")
+```
+
+```{r unique-v-trade-threat}
+# Do uniqueness & threat interact to predict prob of being traded?
+mod3 <-
+  phyloglm(traded ~ CU_c_spMax * iucn,
+           phy = birdtree,
+           data = spp_colour_main,
+           boot = 100,
+           btol = 10)
+saveRDS(mod3, "data/models/trade-unique-threat_mod.Rds")
+mod3_sum <- as.data.frame(summary(mod3)$coefficients)
+saveRDS(mod3_sum, "data/models/trade-unique-threat_mod_sum.Rds")
+```
+
+```{r pred-threat-trade}
+# Predict for threat
+threat_mod <- readRDS("data/models/threat-unique_mod.Rds")
+threat_newdat <-
+    pred_phyloGLM(df = spp_colour_main, 
+                  xvar = "CU_c_spMax", 
+                  yvar = "threatened", 
+                  mod = threat_mod)
+
+# Predict for trade
+trade_mod <- readRDS("data/models/trade-unique_mod.Rds")
+trade_newdat <-
+    pred_phyloGLM(df = spp_colour_main, 
+                  xvar = "CU_c_spMax", 
+                  yvar = "traded", 
+                  mod = trade_mod)
+# Predict for pet trade
+pet_trade_mod <- readRDS("data/models/trade-unique-threat_mod.Rds")
+pet_trade_newdat <- 
+    lapply(levels(spp_colour_main$iucn), function(x){
+        pred_phyloGLM(df = spp_colour_main, 
+                      xvar = "CU_c_spMax", 
+                      yvar = "traded", 
+                      mod = pet_trade_mod, 
+                      iucn_level = x)
+    }) %>% 
+    bind_rows() %>% 
+    mutate(iucn = factor(iucn, levels = levels(spp_colour_main$iucn)),
+           trade_type = "Traded as pet") %>% 
+    rename(trade_value = traded)
+```
+
+```{r future-trade}
+####### Analyses
+
+# 1) we run a pgls model to check the correlation between trade and colour uniqueness
+# This is equivalent to a phylogenetic logistic regression. Thus fitted values represent probabilities of being traded (1) or not (0)
+res_pgls <- readRDS("data/models/trade-unique_mod.Rds")
+
+# 2) Get values from pgls
+data_pgls <- data.frame(
+  sp = row.names(res_pgls$X), 
+  Prob_body = res_pgls$fitted.values)
+
+# 3) Get the probability of non-traded species to be traded in the future
+not_traded <- 
+  as.character(spp_colour_main$species[which(spp_colour_main$traded == 0)])
+fut_trade_prob <- data.frame(data_pgls[data_pgls$sp %in% not_traded,])
+
+# Save for SOM
+fut_trade_prob <- 
+  as.data.frame(fut_trade_prob) %>% 
+  left_join(dplyr::select(spp_colour_main, species, family, CU_c_spMax), 
+            by = c("sp" = "species")) %>% 
+  mutate(sp = gsub("_", " ", sp),
+         CU_c_spMax = signif(CU_c_spMax, 3),
+         Prob_body = signif((Prob_body * 100), 3))  %>% 
+  arrange(-CU_c_spMax,
+          -Prob_body) %>% 
+  dplyr::select("Scientific name" = sp,
+                Family = family,
+                Uniqueness = CU_c_spMax,
+                "Trade probability (%)" = Prob_body)
+# Write
+write.csv(fut_trade_prob, "data/models/future_trade_prob.csv", row.names = FALSE)
+```
+
+## Domestic vs. interntional
+
+```{r}
+# Does uniqueness predict prob of being threatened?
+mod_domestic <-
+  phyloglm(SiTDB_domestic_trade ~ CU_c_spMax * iucn,
+           phy = birdtree,
+           data = spp_colour_main,
+           boot = 100,
+           btol = 10)
+saveRDS(mod_domestic, "data/models/tradeDomestic-unique-threat_mod.Rds")
+mod_domestic_sum <- as.data.frame(summary(mod_domestic)$coefficients)
+saveRDS(mod_domestic_sum, "data/models/tradeDomestic-unique-threat_mod_sum.Rds")
+
+mod_international <-
+  phyloglm(SiTDB_international_trade ~ CU_c_spMax * iucn,
+           phy = birdtree,
+           data = spp_colour_main,
+           boot = 100,
+           btol = 10)
+saveRDS(mod_international, "data/models/tradeInternational-unique-threat_mod.Rds")
+mod_international_sum <- as.data.frame(summary(mod_international)$coefficients)
+saveRDS(mod_international_sum, "data/models/tradeInternational-unique-threat_mod_sum.Rds")
+
+# Predict for domestic trade
+# mod_domestic <- readRDS("data/models/tradeDomestic-unique-threat_mod.Rds")
+trade_domestic_newdat <- 
+    lapply(levels(spp_colour_main$iucn), function(x){
+        pred_phyloGLM(df = spp_colour_main, 
+                      xvar = "CU_c_spMax", 
+                      yvar = "SiTDB_domestic_trade", 
+                      mod = mod_domestic, 
+                      iucn_level = x)
+    }) %>% 
+    bind_rows() %>% 
+    mutate(iucn = factor(iucn, levels = levels(spp_colour_main$iucn)),
+           trade_type = "Traded domestically") %>% 
+    rename(trade_value = SiTDB_domestic_trade)
+
+# Predict for international trade
+# mod_internationl <- readRDS("data/models/tradeInternational-unique-threat_mod.Rds")
+trade_international_newdat <- 
+    lapply(levels(spp_colour_main$iucn), function(x){
+        pred_phyloGLM(df = spp_colour_main, 
+                      xvar = "CU_c_spMax", 
+                      yvar = "SiTDB_international_trade", 
+                      mod = mod_international, 
+                      iucn_level = x)
+    }) %>% 
+    bind_rows() %>% 
+    mutate(iucn = factor(iucn, levels = levels(spp_colour_main$iucn)),
+           trade_type = "Traded internationally") %>% 
+    rename(trade_value = SiTDB_international_trade)
+
+# Bind
+domesticInter_newdat <- 
+  rbind(trade_domestic_newdat, trade_international_newdat) %>% 
+  mutate(iucn = droplevels(iucn))
+
+ggplot(domesticInter_newdat, 
+       aes(x = CU_c_spMax, y = trade_value , colour = iucn)) +
+  geom_line() +
+  facet_wrap(~ trade_type) +
+  xlab("Global colour uniqueness") +
+  ylab("Probability of being threatened\n") +
+  scale_colour_manual(values = iucnpal[3:7]) +
+  theme_bw() +
+  theme(axis.text = element_text(size = text_size, 
+                                 colour = "black"),
+        axis.title = element_text(size = title_size),
+        strip.text = element_text(size = lab_size),
+        legend.text = element_text(size = lab_size),
+        legend.position = "right",
+        legend.title = element_blank(),
+        panel.grid = element_blank())
+```
+
+## Wild-caught
+
+```{r}
+# Add variable for traded wild-caught, traded captive-bred
+spp_colour_main <-
+    spp_colour_main %>% 
+    mutate(traded_wild = case_when(
+        traded == 1 & SiTDB_wild_caught == 1 ~ 1,
+        TRUE ~ 0),
+        traded_captive = case_when(
+        traded == 1 & SiTDB_wild_caught == 0 ~ 1,
+        TRUE ~ 0))
+table(spp_colour_main$traded_wild)
+#    0    1 
+# 4015 1251 
+table(spp_colour_main$traded_captive)
+#    0    1 
+# 5109  157 
+
+mod_wild <-
+  phyloglm(traded_wild ~ CU_c_spMax * iucn,
+           phy = birdtree,
+           data = spp_colour_main,
+           boot = 100,
+           btol = 10)
+saveRDS(mod_wild, "data/models/tradeWild-unique-threat_mod.Rds")
+mod_wild_sum <- as.data.frame(summary(mod_wild)$coefficients)
+saveRDS(mod_wild_sum, "data/models/tradeWild-unique-threat_mod_sum.Rds")
+
+mod_captive <-
+  phyloglm(traded_captive ~ CU_c_spMax * iucn,
+           phy = birdtree,
+           data = spp_colour_main,
+           boot = 100,
+           btol = 10)
+saveRDS(mod_captive, "data/models/tradeCaptive-unique-threat_mod.Rds")
+mod_captive_sum <- as.data.frame(summary(mod_captive)$coefficients)
+saveRDS(mod_captive_sum, "data/models/tradeCaptive-unique-threat_mod_sum.Rds")
+
+# Predict for wild-caught trade
+mod_wild <- readRDS("data/models/tradeWild-unique-threat_mod.Rds")
+trade_wild_newdat <- 
+    lapply(levels(spp_colour_main$iucn), function(x){
+        pred_phyloGLM(df = spp_colour_main, 
+                      xvar = "CU_c_spMax", 
+                      yvar = "traded_wild", 
+                      mod = mod_wild, 
+                      iucn_level = x)
+    }) %>% 
+    bind_rows() %>% 
+    mutate(iucn = factor(iucn, levels = levels(spp_colour_main$iucn)),
+           trade_type = "Traded wild-caught") %>% 
+    rename(trade_value = traded_wild)
+
+# Predict for domestic trade
+mod_captive <- readRDS("data/models/tradeCaptive-unique-threat_mod.Rds")
+trade_captive_newdat <- 
+    lapply(levels(spp_colour_main$iucn), function(x){
+        pred_phyloGLM(df = spp_colour_main, 
+                      xvar = "CU_c_spMax", 
+                      yvar = "traded_captive", 
+                      mod = mod_captive, 
+                      iucn_level = x)
+    }) %>% 
+    bind_rows() %>% 
+    mutate(iucn = factor(iucn, levels = levels(spp_colour_main$iucn)),
+           trade_type = "Traded captive bred") %>% 
+    rename(trade_value = traded_captive)
+
+# Bind
+wildCaptive_newdat <- 
+  rbind(trade_wild_newdat, trade_captive_newdat) %>% 
+  mutate(iucn = droplevels(iucn))
+
+ggplot(wildCaptive_newdat, 
+       aes(x = CU_c_spMax, y = trade_value , colour = iucn)) +
+  geom_line() +
+  facet_wrap(~ trade_type) +
+  xlab("Global colour uniqueness") +
+  ylab("Probability of being traded\n") +
+  scale_colour_manual(values = iucnpal[3:7]) +
+  theme_bw() +
+  theme(axis.text = element_text(size = text_size, 
+                                 colour = "black"),
+        axis.title = element_text(size = title_size),
+        strip.text = element_text(size = lab_size),
+        legend.text = element_text(size = lab_size),
+        legend.position = "right",
+        legend.title = element_blank(),
+        panel.grid = element_blank())
+```
+
+```{r, eval = FALSE}
+            
+# Does uniqueness predict prob of being threatened?
+mod_wild <-
+  phyloglm(SiTDB_wild_caught ~ CU_c_spMax * iucn,
+           phy = birdtree,
+           data = spp_colour_main,
+           boot = 100,
+           btol = 10)
+summary(mod_wild)
+saveRDS(mod_wild, "data/models/wildtrade-unique-threat_mod.Rds")
+wildTrade_newdat <-
+    lapply(levels(spp_colour_main$iucn), function(x){
+        pred_phyloGLM(df = spp_colour_main, 
+                      xvar = "CU_c_spMax", 
+                      yvar = "SiTDB_wild_caught", 
+                      mod = mod_wild, 
+                      iucn_level = x)
+    }) %>% 
+    bind_rows() %>% 
+    mutate(iucn = factor(iucn, levels = levels(spp_colour_main$iucn)))
+
+ggplot(wildTrade_newdat, 
+       aes(x = CU_c_spMax, y = SiTDB_wild_caught, colour = iucn)) +
+  geom_line() +
+  xlab("Global colour uniqueness") +
+  ylab("Probability of being threatened\n") +
+  scale_colour_manual(values = iucnpal[3:7]) +
+  theme_bw() +
+  theme(axis.text = element_text(size = text_size, 
+                                 colour = "black"),
+        axis.title = element_text(size = title_size),
+        strip.text = element_text(size = lab_size),
+        legend.text = element_text(size = lab_size),
+        legend.position = "right",
+        legend.title = element_blank(),
+        panel.grid = element_blank())
+```
+
+## Uniqueness vs. ED
+
+```{r}
+spp_colour_main$family <- as.factor(spp_colour_main$family)
+gamm_ED <- 
+  gam(ED ~ 
+        s(CU_c_spMax) + s(family, bs = "re") + s(family, CU_c_spMax, bs = "re"),
+      data = spp_colour_main)
+saveRDS(gamm_ED, "data/models/ED-unique_mod.Rds")
+
+new_data <- tidyr::expand(spp_colour_main, 
+                          family,
+                          CU_c_spMax = unique(CU_c_spMax))
+ED_newdat <- 
+  bind_cols(new_data,
+            as.data.frame(predict(gamm_ED, 
+                                  newdata = new_data,
+                                  se.fit = TRUE))) %>% 
+    rename("ED" = "fit",
+           "se" = "se.fit") %>% 
+    mutate(CI_lo = ED - ci_const * se,
+           CI_hi = ED + ci_const * se)
+
+# Plot against observed data
+ggplot(ED_newdat, 
+       aes(x = CU_c_spMax, y = ED, group = family)) +
+    geom_ribbon(aes(ymin = CI_lo,
+                    ymax = CI_hi),
+                alpha = 0.3) +
+    xlab("Global colour uniqueness") +
+    ylab("Evolutionary Distinctiveness") +
+  geom_line() +
+  geom_point(data = spp_colour_main) +
+    facet_wrap(~ family) +
+    theme_bw() +
+    theme(panel.grid = element_blank())
+```
+
+## Family-level effect
+
+```{r }
+# Model
+spp_colour_main$CU_c_spMax_sc <- scale(spp_colour_main$CU_c_spMax)
+glmer_trade_family <- 
+  glmer(traded ~ CU_c_spMax + iucn + (CU_c_spMax|family),
+        family = "binomial",
+        data = spp_colour_main)
+summary(glmer_trade_family)
+saveRDS(glmer_trade_family, "data/models/trade-unique-threat-family_mod.Rds")
+
+# Predict
+family_trade_newdat <- expand.grid(iucn = levels(spp_colour_main$iucn),
+                                   CU_c_spMax = seq(min(spp_colour_main$CU_c_spMax),
+                                                    max(spp_colour_main$CU_c_spMax), 
+                                                    length.out = 100), 
+                                   family = sort(unique(spp_colour_main$family)))
+family_trade_newdat$traded <- 
+  inv.logit(
+    predict(glmer_trade_family, newdata = family_trade_newdat, re.form= ~(1|family)))
+
+iucnpal <- c("#d81e05", "#fc7f3f", "#f9e814","#cce226", "#60c659")
+names(iucnpal) <- c("CR", "EN", "VU", "NT", "LC")
+
+ggplot(family_trade_newdat,
+       aes(x = CU_c_spMax, y = traded, colour = iucn)) +
+  geom_line() +
+  facet_wrap(~ family) +
+  xlab("Global colour uniqueness") +
+  ylab("Probability of being traded (%)") +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        legend.title = element_blank()) +
+  scale_y_continuous(breaks = seq(0, 1, 0.2),
+                     labels = seq(0, 100, 20)) +
+  scale_colour_manual(values = iucnpal)
+```
+
+## Trade vs. colour
+
+```{r }
+light_trade_mod <-
+  phyloglm(light_patch ~ traded, phy = birdtree, data = spp_colour_main, 
+           boot = 100, btol = 100)
+dark_trade_mod <-
+  phyloglm(dark_patch ~ traded, phy = birdtree, data = spp_colour_main,
+           boot = 100, btol = 100)
+red_trade_mod <-
+  phyloglm(red_patch ~ traded, phy = birdtree, data = spp_colour_main,
+           boot = 100, btol = 100)
+brown_trade_mod <-
+  phyloglm(brown_patch ~ traded, phy = birdtree, data = spp_colour_main,
+           boot = 100, btol = 100)
+orange_trade_mod <-
+  phyloglm(orange_patch ~ traded, phy = birdtree, data = spp_colour_main,
+           boot = 100, btol = 100)
+yellow_trade_mod <-
+  phyloglm(yellow_patch ~ traded, phy = birdtree, data = spp_colour_main,
+           boot = 100, btol = 100)
+chartreuse_green_trade_mod <-
+  phyloglm(chartreuse_green_patch ~ traded, phy = birdtree, data = spp_colour_main,
+           boot = 100, btol = 100)
+green_trade_mod <-
+  phyloglm(green_patch ~ traded, phy = birdtree, data = spp_colour_main,
+           boot = 100, btol = 100)
+spring_green_trade_mod <-
+  phyloglm(spring_green_patch ~ traded, phy = birdtree, data = spp_colour_main,
+           boot = 100, btol = 100)
+cyan_trade_mod <-
+  phyloglm(cyan_patch ~ traded, phy = birdtree, data = spp_colour_main,
+           boot = 100, btol = 100)
+azure_trade_mod <-
+  phyloglm(azure_patch ~ traded, phy = birdtree, data = spp_colour_main,
+           boot = 100, btol = 100)
+blue_trade_mod <-
+  phyloglm(blue_patch ~ traded, phy = birdtree, data = spp_colour_main,
+           boot = 100, btol = 100)
+violet_trade_mod <-
+  phyloglm(violet_patch ~ traded, phy = birdtree, data = spp_colour_main,
+           boot = 100, btol = 100)
+magenta_trade_mod <-
+  phyloglm(magenta_patch ~ traded, phy = birdtree, data = spp_colour_main,
+           boot = 100, btol = 100)
+rose_trade_mod <-
+  phyloglm(rose_patch ~ traded, phy = birdtree, data = spp_colour_main,
+           boot = 100, btol = 100)
+
+light_trade_mod_sum <- 
+    as.data.frame(summary(light_trade_mod)$coefficients) %>% 
+    mutate(colour_cat = "light")
+dark_trade_mod_sum <- 
+    as.data.frame(summary(dark_trade_mod)$coefficients) %>% 
+    mutate(colour_cat = "dark")
+red_trade_mod_sum <- 
+    as.data.frame(summary(red_trade_mod)$coefficients) %>% 
+    mutate(colour_cat = "red")
+brown_trade_mod_sum <- 
+    as.data.frame(summary(brown_trade_mod)$coefficients) %>% 
+    mutate(colour_cat = "brown")
+orange_trade_mod_sum <- 
+    as.data.frame(summary(orange_trade_mod)$coefficients) %>% 
+    mutate(colour_cat = "orange")
+yellow_trade_mod_sum <- 
+    as.data.frame(summary(yellow_trade_mod)$coefficients) %>% 
+    mutate(colour_cat = "yellow")
+chartreuse_green_trade_mod_sum <- 
+    as.data.frame(summary(chartreuse_green_trade_mod)$coefficients) %>% 
+    mutate(colour_cat = "chartreuse_green")
+green_trade_mod_sum <- 
+    as.data.frame(summary(green_trade_mod)$coefficients) %>% 
+    mutate(colour_cat = "green")
+spring_green_trade_mod_sum <- 
+    as.data.frame(summary(spring_green_trade_mod)$coefficients) %>% 
+    mutate(colour_cat = "spring_green")
+cyan_trade_mod_sum <- 
+    as.data.frame(summary(cyan_trade_mod)$coefficients) %>% 
+    mutate(colour_cat = "cyan")
+azure_trade_mod_sum <- 
+    as.data.frame(summary(azure_trade_mod)$coefficients) %>% 
+    mutate(colour_cat = "azure")
+blue_trade_mod_sum <- 
+    as.data.frame(summary(blue_trade_mod)$coefficients) %>% 
+    mutate(colour_cat = "blue")
+violet_trade_mod_sum <- 
+    as.data.frame(summary(violet_trade_mod)$coefficients) %>% 
+    mutate(colour_cat = "violet")
+magenta_trade_mod_sum <- 
+    as.data.frame(summary(magenta_trade_mod)$coefficients) %>% 
+    mutate(colour_cat = "magenta")
+rose_trade_mod_sum <- 
+    as.data.frame(summary(rose_trade_mod)$coefficients) %>% 
+    mutate(colour_cat = "rose")
+
+colour_cat_mods <- 
+  list(light_trade_mod, dark_trade_mod, red_trade_mod, brown_trade_mod, 
+     orange_trade_mod, yellow_trade_mod, chartreuse_green_trade_mod, 
+     green_trade_mod, spring_green_trade_mod, cyan_trade_mod, azure_trade_mod,
+     blue_trade_mod, violet_trade_mod, magenta_trade_mod, rose_trade_mod)
+save(colour_cat_mods, 
+     file = "data/models/colour_cat_trade_mods.Rdata")
+names(colour_cat_mods) <- c("light","dark","red","brown","orange",
+                            "yellow","chartreuse_green","green",
+                            "spring_green","cyan","azure","blue",
+                            "violet","magenta","rose")
+
+colour_cat_mod_sum <- 
+  rbind(light_trade_mod_sum, dark_trade_mod_sum, red_trade_mod_sum, brown_trade_mod_sum, 
+     orange_trade_mod_sum, yellow_trade_mod_sum, chartreuse_green_trade_mod_sum, 
+     green_trade_mod_sum, spring_green_trade_mod_sum, cyan_trade_mod_sum, azure_trade_mod_sum,
+     blue_trade_mod_sum, violet_trade_mod_sum, magenta_trade_mod_sum, rose_trade_mod_sum)
+saveRDS(colour_cat_mod_sum, "data/models/colour_cat_mod_sum.Rds")
+
+colour_cat_results <-
+  lapply(1:length(colour_cat_mods), function(i){
+    mod <- colour_cat_mods[[i]]
+    modsum <- 
+      as.data.frame(summary(mod)$coefficients) %>% 
+      mutate(colour_cat = names(colour_cat_mods)[i])
+    return(modsum[2,])
+}) %>% 
+  bind_rows()
+row.names(colour_cat_results) <- NULL
+colour_cat_results$colour_cat[which(colour_cat_results$p.value <= 0.05)]
+colour_cat_results$colour_cat[which(colour_cat_results$p.value > 0.05)]
+# "orange" "rose"
+
+colour_cat_newdat <-
+  lapply(1:length(colour_cat_mods), function(i){
+    mod <- colour_cat_mods[[i]]
+    
+    # Model coefficients
+    cc <- mod$coefficients
+    # Coefficient SD
+    cc_sd <- mod$sd
+    # Bootstrapped confidence intervals
+    bootci_lo <- mod$bootconfint95[1,]
+    bootci_hi <- mod$bootconfint95[2,]
+    
+    # Predict
+    newdat <- 
+      data.frame(colour_cat = names(colour_cat_mods)[i],
+                 traded = c(FALSE, TRUE),
+                 prob = c(cc[1], cc[1] + cc[2]),
+                 sd = c(cc_sd[1], cc_sd[1] + cc_sd[2]),
+                 ci_lo_boot = c(bootci_lo[1], bootci_lo[1] + bootci_lo[2]),
+                 ci_hi_boot = c(bootci_hi[1], bootci_hi[1] + bootci_hi[2])) %>% 
+      mutate(ci_lo = prob - (1.96 * sd),
+             ci_hi = prob + (1.96 * sd))
+    # Back-transform
+    totrans <- c("prob", "ci_lo", "ci_hi", "ci_lo_boot", "ci_hi_boot")
+    newdat[totrans] <- inv.logit(newdat[totrans])
+    return(newdat)
+}) %>% 
+  bind_rows() %>% 
+  mutate(colour_cat = factor(colour_cat,
+                             levels = names(colour_cat_mods)),
+         colour_cat_numeric = as.numeric(colour_cat))
+```
+
+## Trade vs. CR
+
+```{r}
+# Does contrast ratio predict prob of being threatened?
+cr_mod <-
+  phyloglm(traded ~ CR + iucn,
+           phy = birdtree,
+           data = spp_colour_main,
+           boot = 100,
+           btol = 10)
+saveRDS(cr_mod, "data/models/trade-CR-threat_mod.Rds")
+cr_mod_sum <- as.data.frame(summary(cr_mod)$coefficients)
+saveRDS(cr_mod_sum, "data/models/trade-CR-threat_mod_sum.Rds")
+```
+
+```{r, eval = FALSE}
+# Predict for domestic trade
+cr_mod <- readRDS("data/models/trade-CR-threat_mod.Rds")
+cr_newdat <- 
+    lapply(levels(spp_colour_main$iucn), function(x){
+        pred_phyloGLM(df = spp_colour_main, 
+                      xvar = "CR", 
+                      yvar = "traded", 
+                      mod = cr_mod, 
+                      iucn_level = x)
+    }) %>% 
+    bind_rows() %>% 
+    mutate(iucn = factor(iucn, levels = levels(spp_colour_main$iucn)))
+```
+
+## Domestic ~ realm
+
+```{r}
+
+ggplot(spp_colour_main,
+       aes(x = main_realm, y = CU_c_spMax, 
+           fill = factor(SiTDB_domestic_trade))) +
+    geom_boxplot()
+    
+# Does uniqueness predict prob of being threatened?
+mod_domestic_realm <-
+  phyloglm(SiTDB_domestic_trade ~ CU_c_spMax * iucn + main_realm,
+           phy = birdtree,
+           data = spp_colour_main,
+           boot = 100,
+           btol = 10)
+saveRDS(mod_domestic, "data/models/tradeDomestic-unique-threat_mod.Rds")
+mod_domestic_sum <- as.data.frame(summary(mod_domestic)$coefficients)
+saveRDS(mod_domestic_sum, "data/models/tradeDomestic-unique-threat_mod_sum.Rds")
+```
+
+# Write
+
+```{r write}
+save(threat_newdat,trade_newdat,pet_trade_newdat,
+     domesticInter_newdat,wildCaptive_newdat,
+     colour_cat_newdat,ED_newdat,family_trade_newdat,
+     file = "data/models/model_pred_data.Rdata")
+```

@@ -1,0 +1,718 @@
+
+```{r setup, include=FALSE, echo=FALSE}
+library(knitr)
+opts_knit$set(root.dir = "../")
+```
+
+```{r other-setup}
+library(dplyr)
+library(tidyr)
+library(rgdal)
+library(classInt)
+library(ggplot2)
+library(cowplot)
+library(ggnewscale)
+library(plotly)
+library(phytools)
+library(purrr)
+
+# Define function to capitalise first letter
+capitalise <- function(x) {
+  s <- strsplit(x, " ")[[1]]
+  paste(toupper(substring(s, 1,1)), substring(s, 2),
+        sep = "", collapse = " ")
+}
+# Function to return results of case_when as factor
+fct_case_when <- function(...) {
+  args <- as.list(match.call())
+  levels <- sapply(args[-1], function(f) f[[3]])  # extract RHS of formula
+  levels <- levels[!is.na(levels)]
+  factor(dplyr::case_when(...), levels = levels)
+}
+
+# Function to categorise sig level
+sig_level <- function(p_val){
+  if (!(is.na(p_val))) {
+    if (p_val > 0.05) {
+      result <- "NS"
+    } else if (p_val <=  0.05 & p_val > 0.01) {
+      result <- "*"
+    }else if (p_val <=  0.01 & p_val > 0.001) {
+      result <- "**"
+    }else{
+      result <- "***"
+    }
+  } else result <- NA
+  return(result)
+}
+
+# Function to round to desired multiple
+mround <- function(x,base,FUN){
+  base * FUN(x / base) 
+}
+
+source("code/convhull_plotting.R")
+```
+
+```{r data}
+community_colour <- readRDS(file = "data/sorted/summarise-colour/community_colour.Rds")
+load("data/sorted/prep-for-analyses/analysis_data.Rdata")
+load("data/sorted/summarise-colour/hull_data.Rdata")
+load("data/sorted/summarise-colour/traded_species.Rdata")
+
+# Plotting parameters
+text_size = 6
+title_size = 8
+lab_size = 7
+# Load colour palette
+cbpal <- viridis::viridis(4, option = "D")
+pal <- readRDS("data/misc/colourpal_mute.Rds")
+iucnpal <- c("#000000", "#542344", "#d81e05", "#fc7f3f", 
+             "#f9e814","#cce226", "#60c659", "#d1d1c6", "#ffffff")
+names(iucnpal) <- c("EX", "EW", "CR", "EN", "VU", "NT", "LC", "DD", "NE")
+divpal <- RColorBrewer::brewer.pal(11, "RdBu")
+# Sort legend labels
+pal_labs <- 
+  sapply(names(pal), capitalise)
+pal_labs <- gsub("_", " ", pal_labs)
+
+# Hue pal
+huepal <- unique(spp_colour_main$hex)
+names(huepal) <- unique(spp_colour_main$hex)
+```
+
+```{r sort-sp-data}
+# FD calculated for each patch separately, across all species
+# SES FD calculated for each patch separately, across all species
+# Report the mean SES FD, and take the log of this
+
+# Uniqueness calculated for each patch of each species
+# Cell mean uniqueness is calculated across species by taking mean of each species' most unique patch
+# SES cell mean uniqeueness same as above
+
+# The slight difference is that FD and SES FD are calculated for given patch,
+# across all species in grid cell, and then one value is reached by taking the
+# mean across the six patches 
+#   -> start at a patch/cell level
+#   -> get to cell level by taking mean across patches
+# To get a single cell value for uniqueness and SES uniqueness, uniqueness is
+# calculated for each patch of each species and then you take the mean of each 
+# species' most unique patch (species-level max)#
+#   -> start at a patch/species level
+#   -> get to species level by taking max
+#   -> get to cell level by taking mean
+```
+
+
+```{r sort-main-community}
+# ------------------------------------------------------------------------------
+# Community-level
+# ------------------------------------------------------------------------------
+
+# Main dataframe has just one row per cell 
+# (one patch and one future sim as arbitrary reference)
+community_colour_main <-
+  community_colour %>%
+  filter(
+    # Choose crown patch for displaying hex (for pretty figures)
+    patch == "crown",
+    # Chose 50% removed as a reference
+    # kill_prop == "prop50" | is.na(kill_prop)
+    ) %>%
+  # Remove patch-level variables
+  dplyr::select(c(coords, longitude, latitude,
+                  veg, mean.temp, mean.prec, NPP, elev, tri, tpi, roughness, 
+                  slope, aspect, Realm, ecoregion, realm_olsen, biome,
+                  light_richness, 
+                  dark_richness,
+                  red_richness,
+                  brown_richness,
+                  orange_richness,
+                  yellow_richness,
+                  chartreuse_green_richness,
+                  green_richness,
+                  spring_green_richness,
+                  cyan_richness,
+                  azure_richness,
+                  blue_richness,
+                  violet_richness,
+                  magenta_richness,
+                  rose_richness,
+                  hex,
+                  spN,
+                  trade_N,
+                  tradePet_N,
+                  tradeProd_N,
+                  # _______
+                  # Current
+                  # - COLOUR DIVERSITY
+                  # Cell mean colour diversity
+                  CD_cellMean,
+                  # Cell mean SES colour diversity (global species pool) 
+                  ses_CD_global_cellMean,
+                  # - COLOUR UNIQUENESS
+                  # Cell mean colour uniqueness 
+                  CU_cellMean,
+                  # Cell mean SES colour uniqueness (global species pool)
+                  ses_CU_global_cellMean,
+                  # Cell mean pattern diversity
+                  PD_cc_cellMean,
+                  # Cell mean body uniqueness
+                  BU_cc_cellMean,
+                  # ______
+                  # Future
+                  # kill_prop,
+                  # - COLOUR DIVERSITY
+                  # Cell mean SES colour diversity loss
+                  CD_fc_loss_cellMean,
+                  ses_CD_loss_cellMean,
+                  # - COLOUR UNIQUENESS
+                  # Cell mean SES colour uniqueness loss
+                  CU_fc_loss_cellMean,
+                  ses_CU_loss_cellMean)) %>% 
+  mutate(
+    # Standardise CD
+    CD_cellMean = CD_cellMean / max(CD_cellMean, na.rm = TRUE),
+    # Calculate prop species traded/threatened
+    trade_prop = trade_N / spN) %>% 
+  # Rename some stuff
+  rename(uniqueness_cellMean = CU_cellMean,
+         uniqueness_cellMean_SES = ses_CU_global_cellMean,
+         diversity_cellMean = CD_cellMean,
+         diversity_cellMean_SES = ses_CD_global_cellMean)
+
+# Upper percentiles for species richness
+spRich_upperq <- 
+  quantile(community_colour_main$spN, probs = c(0.75, 0.9, 0.95), na.rm = TRUE)
+# Upper percentiles for trade prop
+trade_upperq <- 
+  quantile(community_colour_main$trade_N / community_colour_main$spN, 
+           probs = c(0.75, 0.9, 0.95), na.rm = TRUE)
+
+# Upper percentiles for colour diversity
+cd_upperq <- 
+  quantile(community_colour_main$diversity_cellMean, 
+           probs = c(0.75, 0.9, 0.95), na.rm = TRUE)
+# Upper percentiles for colour uniqueness
+cu_upperq <- 
+  quantile(community_colour_main$uniqueness_cellMean, 
+           probs = c(0.75, 0.9, 0.95), na.rm = TRUE)
+
+# Identify hotspot cells
+community_colour_main <-
+  community_colour_main %>%
+  mutate(
+    richness_hotspot =
+      case_when(spN >= spRich_upperq[1] &
+                  spN < spRich_upperq[2] ~ "q75",
+                spN >= spRich_upperq[2] &
+                  spN < spRich_upperq[3] ~ "q90",
+                spN >= spRich_upperq[3] ~ "q95",
+                TRUE ~ "none"),
+    trade_hotspot =
+      case_when(trade_prop >= trade_upperq[1] &
+                  trade_prop < trade_upperq[2] ~ "q75",
+                trade_prop >= trade_upperq[2] &
+                  trade_prop < trade_upperq[3] ~ "q90",
+                trade_prop >= trade_upperq[3] ~ "q95",
+                TRUE ~ "none"),
+
+    diversity_hotspot =
+      case_when(diversity_cellMean >= cd_upperq[1] &
+                  diversity_cellMean < cd_upperq[2] ~ "q75",
+                diversity_cellMean >= cd_upperq[2] &
+                  diversity_cellMean < cd_upperq[3] ~ "q90",
+                diversity_cellMean >= cd_upperq[3] ~ "q95",
+                TRUE ~ "none"),
+    uniqueness_hotspot = 
+      case_when(uniqueness_cellMean >= cu_upperq[1] &
+                  uniqueness_cellMean < cu_upperq[2] ~ "q75",
+                uniqueness_cellMean >= cu_upperq[2] &
+                  uniqueness_cellMean < cu_upperq[3] ~ "q90",
+                uniqueness_cellMean >= cu_upperq[3] ~ "q95",
+                TRUE ~ "none")
+  )
+
+# Relevel biome
+community_colour_main$biome <-
+  factor(community_colour_main$biome,
+         levels = 14:1)
+
+# Fisher classification for mean uniqueness
+classes <- classIntervals(community_colour_main$uniqueness_cellMean, 
+                          n = 10, style = "fisher")
+community_colour_main <- 
+  community_colour_main %>%
+  mutate(uniqueness_class =
+           cut(community_colour_main$uniqueness_cellMean, 
+               classes$brks, 
+               include.lowest = TRUE))
+
+# Coerce to dataframe
+community_colour_main <- as.data.frame(community_colour_main)
+
+# Sum richness values by latitude for marginal plots
+community_colour_rich <-
+  # Gather wide to long for different colours
+  gather(community_colour_main, key = "colour", value = "richness",
+         paste(names(pal), "richness", sep = "_")) %>% 
+  dplyr::select(coords, longitude, latitude, colour, richness) %>% 
+  mutate(colour = factor(colour, 
+                         levels = paste(names(pal), "richness", sep = "_"),
+                         labels = names(pal))) %>% 
+  # Group by latitude and colour
+  group_by(colour, latitude) %>% 
+  summarise(
+    # Total richness
+    richness_sum = sum(richness),
+    # Mean richness
+    richness_mean = mean(richness),
+    # SD 
+    richness_sd = sd(richness),
+    # SE 
+    richness_se = richness_sd / (sqrt(n())),
+    # CI
+    richness_upr = richness_mean + (1.96 * richness_se),
+    richness_lwr = richness_mean - (1.96 * richness_se))
+
+# Sum diversity metrics by latitude for marginal plots
+community_diversity <-
+  # Gather wide to long for different colours
+  gather(community_colour_main, key = "metric", value = "value",
+         "uniqueness_cellMean", 
+         "uniqueness_cellMean_SES",
+         "diversity_cellMean",
+         "diversity_cellMean_SES") %>% 
+  dplyr::select(coords, longitude, latitude, metric, value) %>%
+  # Group by latitude and metric
+  group_by(metric, latitude) %>% 
+  summarise(
+    # Mean
+    value_mean = mean(value, na.rm = TRUE),
+    # SD 
+    value_sd = sd(value, na.rm = TRUE),
+    # SE 
+    value_se = value_sd / (sqrt(n())),
+    # CI
+    value_upr = value_mean + (1.96 * value_se),
+    value_lwr = value_mean - (1.96 * value_se))
+```
+
+```{r sort-future-community}
+# Future dataframe has 10 rows per cell (one per sim, 10-100% removal in 10% increments)
+community_colour_fut <-
+    community_colour %>% 
+    filter(
+        # Choose crown patch arbitrarily
+        patch == "crown",
+        !(is.na(kill_prop))
+    ) %>% 
+    # Select key variables
+    dplyr::select(
+        longitude, latitude,
+        kill_prop,
+        CD_fc_loss_cellMean,
+        ses_CD_loss_cellMean,
+        CU_fc_loss_cellMean,
+        ses_CU_loss_cellMean
+    ) %>% 
+    # Standardise CD
+    mutate(CD_fc_loss_cellMean = 
+               CD_fc_loss_cellMean / max(CD_fc_loss_cellMean, na.rm = TRUE),
+           kill_prop_num = 
+               as.numeric(paste(
+                   factor(kill_prop,
+                          levels = paste("prop",seq(10,100,10),sep= ""),
+                          labels = seq(10,100,10))))) %>% 
+    # Rename some stuff
+    rename(uniqueness_cellMean_change = CU_fc_loss_cellMean,
+           uniqueness_cellMean_SES_change = ses_CU_loss_cellMean,
+           diversity_cellMean_change = CD_fc_loss_cellMean,
+           diversity_cellMean_SES_change = ses_CD_loss_cellMean) %>% 
+    # Categorise
+    mutate(
+        diversity_cellMean_SES_change_round = 
+            case_when(
+                # If greater than or equal to 1.96, define as 1.96
+                diversity_cellMean_SES_change >= 1.96 ~ 1.96,
+                # If between -1.96 and 1.96, define as 0
+                diversity_cellMean_SES_change < 1.96 &
+                    diversity_cellMean_SES_change > -1.96 ~ 0,
+                # If less than or equal to -1.96, define as -1.96
+                diversity_cellMean_SES_change <= -1.96 ~ -1.96),
+        uniqueness_cellMean_SES_change_round = 
+            case_when(uniqueness_cellMean_SES_change >= 1.96 ~ 1.96,
+                      uniqueness_cellMean_SES_change < 1.96 &
+                          uniqueness_cellMean_SES_change > -1.96 ~ 0,
+                      uniqueness_cellMean_SES_change <= -1.96 ~ -1.96)) %>% 
+    as.data.frame(.)
+```
+
+```{r richness-map-fn}
+# Function to create colour pal
+palfn <- function(colour, lowval, n) colorRampPalette(c(lowval, colour))(n)
+
+plot_richness <- function(df_main, df_lat, colour, marginal_type = "density"){
+  # Define response variable
+  richvar <- paste(colour, "richness", sep = "_")
+  # Recode zeroes to negative to force different colour
+  # df[df[,richvar] == 0,richvar] <- -1
+  # Identify maximum richness
+  maxrich <- max(df_main[,richvar], na.rm = TRUE)
+  # Create colour palette
+  gradientpal <- palfn(colour = pal[colour],
+                       lowval = ifelse(colour != "light", "#eaeaea", "grey95"), 
+                       n = maxrich / 2)
+  ### Map
+  p_map <-
+    ggplot() +
+    # Richness raster
+    geom_raster(data = df_main,
+              aes(x = longitude,
+                  y = latitude,
+                  fill = df_main[,richvar])) +
+    # Equator
+    geom_hline(yintercept = 0,
+               linetype = "solid",
+               colour = "grey80",
+               size = 0.3) +
+    # Tropic of cancer
+    geom_hline(yintercept = 2521661.711693,
+               linetype = "dotted",
+               colour = "grey80",
+               size = 0.3) +
+    # Tropic of capricorn
+    geom_hline(yintercept = -2521641.378329,
+               linetype = "dotted",
+               colour = "grey80",
+               size = 0.3) +
+    theme_void() +
+    theme(legend.position = "bottom",
+          legend.spacing = unit(0, "cm"),
+          legend.margin = margin(-1,0,0,0, unit = "cm"),
+          legend.title = element_text(size = title_size),
+          legend.text = element_text(size = text_size)) +
+    # Fill gradient from white to relevant colour in colour palette
+    scale_fill_gradientn(colours = gradientpal,
+                         na.value = "black",
+                         name = 
+                           paste("No. species with", colour, "colouration"),
+                         limits = c(0, maxrich),
+                         oob = scales::squish) +
+    guides(colour = FALSE,
+           fill = guide_colourbar(frame.colour = "grey50", 
+                                  title.position = "top", 
+                                  barheight = unit(0.1, "cm"),
+                                  barwidth = unit(4.1, "cm")))
+  
+  ### Latitude marginal plot
+  if (marginal_type == "density") {
+    # Create dataframe with each latitude value replicated to match the number
+    # of species found there with the focal colour
+    df_lat <- 
+      apply(df_lat[df_lat[, "colour"] == colour,], 
+            MARGIN = 1, function(x){
+              rep(x["latitude"], x["richness_sum"])
+            }) %>% 
+      unlist() %>% 
+      as.data.frame()
+    colnames(df_lat) <- "latitude"
+    df_lat$latitude <- as.numeric(paste(df_lat$latitude))
+    
+    p_marginal <-
+      ggplot() +
+      geom_density(data = df_lat, 
+                   aes(x = latitude),
+                   fill = "grey80",
+                   colour = NA) +
+      coord_flip() +
+      theme_void()
+  }else if (marginal_type == "mean") {
+    p_marginal <-
+      ggplot(df_lat[df_lat[, "colour"] == colour,], 
+             aes(x = latitude, y = richness_mean)) +
+      geom_ribbon(aes(ymin = richness_lwr,
+                      ymax = richness_upr),
+                  alpha = 0.3) +
+      geom_line(colour = pal[colour]) +
+      coord_flip() +
+      # ylab("Mean spp.\nrichness") +
+      theme_classic() +
+      theme(axis.title = element_blank(),
+            axis.text.y = element_blank(),
+            axis.ticks.y = element_blank(),
+            # axis.title.x = element_text(size = title_size - 0.5),
+            axis.text.x = element_text(size = text_size - 1,
+                                       angle = 45))
+  }
+  
+  # Make colour legend separate (to centralise)
+  map_legend <- get_legend(p_map)
+  p_map <-
+    p_map +
+    theme(legend.position = "none")
+  p <-
+    plot_grid(p_map, p_marginal, 
+              nrow = 1, rel_widths = c(0.9, 0.1), 
+              align = "hv", axis = "tblr")
+  p <-
+    plot_grid(p, map_legend, 
+              ncol = 1, rel_heights = c(100, 1))
+  
+  return(p)
+}
+```
+
+```{r diversity-map-fn}
+plot_diversity <- function(df, df_lat, metric, scale, name,
+                           marginal = TRUE,
+                           latlines = TRUE,
+                           realm_legend = TRUE,
+                           low = NULL, high = NULL, 
+                           breaks = NULL,
+                           limits = NULL,
+                           barwidth = 3,
+                           barheight = 0.3){
+  if (metric == "uniqueness_class") df <- df[!(is.na(df[, metric])),]
+  p_map <-
+    ggplot() +
+    # Diversity raster
+    geom_raster(data = df,
+              aes(x = longitude,
+                  y = latitude,
+                  fill = df[,metric])) +
+    theme_void() +
+    theme(legend.position = "bottom", 
+          legend.justification = "center", 
+          legend.box = "vertical", 
+          legend.box.margin = margin(-0.7,0,0.5,0, unit = "cm"),
+          legend.title.align = 0.5,
+          legend.spacing = unit(0, units = "cm"),
+          legend.key.size = unit(0.4, units = "cm"),
+          legend.title = element_text(size = title_size),
+          legend.text = element_text(size = text_size))
+  
+  if (latlines) {
+    p_map <- p_map +     
+      # Equator
+      geom_hline(yintercept = 0,
+                 linetype = "solid",
+                 colour = "grey80",
+                 size = 0.3) +
+      # Tropic of cancer
+      geom_hline(yintercept = 2521661.711693,
+                 linetype = "dotted",
+                 colour = "grey80",
+                 size = 0.3) +
+      # Tropic of capricorn
+      geom_hline(yintercept = -2521641.378329,
+                 linetype = "dotted",
+                 colour = "grey80",
+                 size = 0.3)
+  }
+  
+  if (metric != "uniqueness_class") {
+    p_map <- p_map + 
+      guides(fill = guide_colorbar(title = name, 
+                                   title.position = "top",
+                                   barwidth = unit(barwidth, units = "cm"),
+                                   barheight = unit(barheight, units = "cm"),
+                                   order = 1))
+    
+    if (is.null(df_lat)) {
+      p_marginal <- ggplot() + theme_void()
+    } else {
+      # Latitude marginal plot
+      p_marginal <-
+        ggplot(df_lat[df_lat[, "metric"] == metric,], 
+               aes(x = latitude, y = value_mean)) +
+        geom_ribbon(aes(ymin = value_lwr,
+                        ymax = value_upr),
+                    alpha = 0.3) +
+        geom_line(aes(colour = value_mean)) +
+        coord_flip() +
+        theme_classic() +
+        theme(axis.title.x = element_text(size = text_size),
+              axis.title.y = element_blank(),
+              axis.text.y = element_blank(),
+              axis.ticks.y = element_blank(),
+              axis.text.x = element_text(size = text_size - 1,
+                                         angle = 0),
+              legend.position = "none") +
+          scale_y_continuous(name = name)
+    }
+  } else{
+    p_map <- 
+      p_map +
+      guides(fill = guide_legend(title = name, 
+                                 title.position = "top",
+                                 nrow = 1,
+                                 label.position = "bottom",
+                                 order = 1))
+    if (is.null(df_lat)) {
+      p_marginal <- ggplot() + theme_void()
+    } else {
+      # Latitude marginal plot
+      p_marginal <-
+        ggplot(df_lat[df_lat[, "metric"] == "uniqueness_cellMean",], 
+               aes(x = latitude, y = value_mean)) +
+        geom_ribbon(aes(ymin = value_lwr,
+                        ymax = value_upr),
+                    alpha = 0.3) +
+        geom_line(aes(colour = value_mean)) +
+        coord_flip() +
+        theme_classic() +
+        theme(axis.title = element_blank(),
+              axis.text.y = element_blank(),
+              axis.ticks.y = element_blank(),
+              axis.text.x = element_text(size = text_size - 1,
+                                         angle = 45),
+              legend.position = "none")
+    }
+  }
+  
+  if (scale == "seq") {
+    p_map <- p_map + 
+      scale_fill_viridis_c()
+    p_marginal <- p_marginal + scale_colour_viridis_c()
+  }else if (scale == "div") {
+    p_map <- p_map + 
+      scale_fill_gradient2(low = low,
+                           mid = "beige",
+                           high = high, 
+                           breaks = breaks,
+                           limits = limits)
+    p_marginal <- p_marginal + scale_colour_gradient2(low = low,
+                                                      mid = "beige",
+                                                      high = high, 
+                                                      breaks = breaks,
+                                                      limits = limits)
+  }else if (scale == "fisher") {
+    p_map <- p_map + 
+      scale_fill_viridis_d()
+    p_marginal <- p_marginal + scale_colour_viridis_c()
+  }else{
+    warning("Invalid scale")
+  }
+  # p <-
+  #   plot_grid(p_map, p_marginal, 
+  #             nrow = 1, rel_widths = c(0.9, 0.1), 
+  #             align = "hv", axis = "tblr")
+  
+  if (marginal) {
+    # Make colour legend separate (to centralise)
+    map_legend <- get_legend(p_map)
+    p_map <-
+      p_map +
+      theme(legend.position = "none")
+    p <-
+      plot_grid(p_map, p_marginal, 
+                nrow = 1, rel_widths = c(0.9, 0.1), 
+                align = "hv", axis = "tblr")
+    p <-
+      plot_grid(p, map_legend, 
+                ncol = 1, rel_heights = c(100, 1))
+    return(p)
+  } else {
+    return(p_map)
+  }
+}
+```
+
+```{r ses-map-fn}
+plot_ses <- function(df, metric, name, breaks,
+                     high = "red4", mid = "beige", low = "dodgerblue"){
+  p_map <-
+    ggplot() +
+    # Raster
+    geom_raster(data = df,
+              aes(x = longitude,
+                  y = latitude,
+                  fill = df[,metric])) +
+    theme_void() +
+    theme(legend.position = "bottom", 
+          legend.justification = "center", 
+          legend.box = "vertical", 
+          legend.box.margin = margin(0,0,0.5,0, unit = "cm"),
+          legend.title.align = 0.5,
+          legend.spacing = unit(0, units = "cm"),
+          legend.key.size = unit(0.4, units = "cm"),
+          legend.title = element_text(size = title_size),
+          legend.text = element_text(size = text_size)) +
+    scale_fill_manual(name = name, 
+                      values = c(mid, high, low),
+                      breaks = breaks,
+                      na.value = "#7F7F7F") +
+    guides(fill = guide_legend(title.position = "top"))
+  return(p_map)
+}
+```
+
+```{r phyloGLM-fn}
+# Function to plot model-predicted values
+plot_phyloGLM <- function(newdat, rawdat, xvar, yvar, 
+                          xlabel, ylabel,
+                          legpos = NULL,
+                          inter = FALSE, pal) {
+  if (inter) {
+    p <-
+      ggplot() +
+      geom_line(data = newdat,
+                aes(x = newdat[, xvar],
+                    y = newdat[, yvar],
+                    colour = newdat[,"iucn"])) +
+      scale_colour_manual(name = NULL,
+                          values = iucnpal) +
+      # geoms below will use another color scale
+      new_scale_color() +
+      geom_jitter(data = rawdat, 
+                  aes(x = rawdat[,xvar], 
+                      y = rawdat[, yvar],
+                      colour = rawdat[, "colour_cat"]),
+                  size = 1,
+                  width = 0, 
+                  height = 0.01, 
+                  alpha = 0.5) +
+      facet_wrap(~ trade_type)
+  } else {
+    p <-
+      ggplot() +
+      geom_line(data = newdat,
+                aes(x = newdat[, xvar],
+                    y = newdat[, yvar])) +
+      geom_jitter(data = rawdat, 
+                  aes(x = rawdat[,xvar], 
+                      y = rawdat[, yvar],
+                      colour = rawdat[, "colour_cat"]),
+                  size = 1,
+                  width = 0, 
+                  height = 0.01, 
+                  alpha = 0.5)
+  }
+  p <- p +
+    xlab(xlabel) +
+    ylab(ylabel) +
+    scale_colour_manual(values = pal, 
+                        guide = FALSE) +
+    theme_bw() +
+    theme(axis.text = element_text(size = text_size, 
+                                   colour = "black"),
+          axis.title = element_text(size = title_size),
+          strip.text = element_text(size = lab_size),
+          legend.text = element_text(size = lab_size),
+          legend.direction = "horizontal",
+          panel.grid = element_blank())
+  return(p)
+}
+```
+
+```{r write}
+save(birdtree, spp_colour_main,
+     community_colour_main,
+     community_colour_fut,
+     community_colour_rich, community_diversity, 
+     cbpal, huepal, pal, pal_labs, iucnpal, divpal,
+     text_size, title_size, lab_size,
+     palfn, plot_diversity, plot_richness, plot_ses, plot_phyloGLM,
+     file = "data/sorted/prep-for-plotting/plot_data.Rdata")
+```

@@ -1,0 +1,207 @@
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = "../../../")
+knitr::opts_chunk$set(echo = FALSE,message = FALSE,error = FALSE, warning = FALSE)
+
+library(knitr)
+library(dplyr)
+library(cowplot)
+library(ggplot2)
+library(ggnewscale)
+```
+
+```{r plot-dat}
+load("data/sorted/prep-for-plotting/plot_data.Rdata")
+load("data/models/model_pred_data.Rdata")
+```
+
+```{r fig-2}
+diversity_map <- 
+  plot_diversity(df = community_colour_main, 
+                 df_lat = community_diversity,
+                 metric = "diversity_cellMean", 
+                 scale = "seq", 
+                 name = "Colour diversity")
+# Plot SES colour diversity
+# - mean of SES convex hull vol calculated for each body part
+p_fd_ses <-
+  plot_diversity(df = community_colour_main, 
+                 df_lat = community_diversity,
+                 metric = "diversity_cellMean_SES", 
+                 realm_legend = FALSE,
+                 scale = "div",
+                 high = divpal[10],
+                 low = divpal[2],
+                 breaks = seq(-5, 4, 1),
+                 name = "SES colour diversity")
+
+uniqueness_map <-
+  plot_diversity(df = community_colour_main, 
+                 df_lat = community_diversity,
+                 metric = "uniqueness_cellMean", 
+                 scale = "seq", 
+                 name = "Colour uniqueness")
+
+# Plot SES colour uniqueness
+# - SES cell mean uniqueness
+p_unique_ses <- 
+  plot_diversity(df = community_colour_main, 
+                 df_lat = community_diversity,
+                 metric = "uniqueness_cellMean_SES", 
+                 realm_legend = FALSE,
+                 scale = "div",
+                 high = divpal[10],
+                 low = divpal[2],
+                 breaks = seq(-2, 8, 2),
+                 name = "SES colour uniqueness") +
+  guides(colour = FALSE)
+
+plot_grid(diversity_map, p_fd_ses,
+          uniqueness_map, p_unique_ses,
+          ncol = 1, 
+          nrow = 4, 
+          labels = LETTERS[1:4], 
+          label_size = 8)
+```
+
+```{r fig-4}
+# Palette for IUCN categories
+iucnpal2 <- c("#33a02c","#b2df8a","#fee08b","#ff7f00","#e31a1c", "black")
+names(iucnpal2) <- c(levels(domesticInter_newdat$iucn), "mean")
+
+##Fig 4c/d = domestic/international trade -------------------------------------------------
+sumdat_domesticInter <-
+  group_by(domesticInter_newdat, trade_type, CU_c_spMax) %>% 
+  summarise(trade_value = mean(trade_value, na.rm = TRUE)) %>% 
+  mutate(iucn = "mean",
+         ci_lo = NA,
+         ci_hi = NA,
+         ci_lo_boot = NA,
+         ci_hi_boot = NA,
+         logis = NA) %>% 
+  dplyr::select(names(domesticInter_newdat))
+sumdat_domesticInter <- 
+  bind_rows(domesticInter_newdat, sumdat_domesticInter) %>% 
+    mutate(iucn = factor(iucn,
+                       levels = c(levels(domesticInter_newdat$iucn), "mean")),
+           trade_type = factor(trade_type,
+                             levels = c("Traded domestically", "Traded internationally"),
+                             labels = c("Traded domestically (SiTDB)",
+                                        "Traded internationally (SiTDB)")))
+# Plot
+p_domesticInter <-
+    ggplot() +
+    geom_line(data = sumdat_domesticInter,
+              aes(x = CU_c_spMax,
+                  y = trade_value,
+                  colour = iucn, 
+                  linetype = iucn)) +
+    facet_wrap(~ trade_type) +
+    xlab("") +
+    ylab("Probability of being traded (%)") +
+    scale_colour_manual(name = NULL,
+                        values = iucnpal2) +
+    scale_linetype_manual(name = NULL,
+                          values = c(rep("solid", 5), "dotted")) +
+    new_scale_color() +
+    geom_jitter(data = 
+                    spp_colour_main %>% 
+                    dplyr::select(species,family,CU_c_spMax,iucn,colour_cat,
+                                  SiTDB_domestic_trade,SiTDB_international_trade) %>% 
+                    tidyr::gather(SiTDB_domestic_trade,SiTDB_international_trade,
+                                  key = "trade_type", value = "trade_value") %>% 
+                    mutate(trade_type = factor(trade_type,
+                                               levels = c("SiTDB_domestic_trade", "SiTDB_international_trade"),
+                                               labels = c("Traded domestically (SiTDB)",
+                                                          "Traded internationally (SiTDB)"))), 
+                aes(x = CU_c_spMax, 
+                    y = trade_value,
+                    colour = colour_cat),
+                # colour = "grey",
+                size = 1,
+                width = 0, 
+                height = 0.01, 
+                alpha = 0.5) +
+    scale_colour_manual(values = pal, guide = FALSE) +
+    theme_bw() +
+    theme(panel.grid = element_blank(),
+          axis.text = element_text(size = text_size, 
+                                   colour = "black"),
+          axis.title = element_text(size = title_size),
+          strip.text = element_text(size = lab_size),
+          legend.position = "none") +
+    scale_y_continuous(breaks = seq(0,1,0.1),
+                       labels = seq(0,100,10))
+
+##Fig 4e/f = captive/wild trade -------------------------------------------------
+sumdat_wildCaptive <-
+  group_by(wildCaptive_newdat, trade_type, CU_c_spMax) %>% 
+  summarise(trade_value = mean(trade_value, na.rm = TRUE)) %>% 
+  mutate(iucn = "mean",
+         ci_lo = NA,
+         ci_hi = NA,
+         ci_lo_boot = NA,
+         ci_hi_boot = NA,
+         logis = NA) %>% 
+  dplyr::select(names(wildCaptive_newdat))
+sumdat_wildCaptive <- 
+  bind_rows(wildCaptive_newdat, sumdat_wildCaptive) %>%
+    mutate(iucn = factor(iucn,
+                       levels = c(levels(wildCaptive_newdat$iucn), "mean")),
+           trade_type = factor(trade_type,
+                             levels = c("Traded captive bred", "Traded wild-caught"),
+                             labels = c("Trade of captive-bred individuals (SiTDB)",
+                                        "Trade of wild-caught individuals (SiTDB)")))
+
+p_wildCaptive <-
+    ggplot() +
+    geom_line(data = sumdat_wildCaptive,
+              aes(x = CU_c_spMax,
+                  y = trade_value,
+                  colour = iucn, 
+                  linetype = iucn)) +
+    facet_wrap(~ trade_type) +
+    xlab("Global colour uniqueness") +
+    ylab("") +
+    scale_colour_manual(name = NULL,
+                        values = iucnpal2) +
+    scale_linetype_manual(name = NULL,
+                          values = c(rep("solid", 5), "dotted")) +
+    new_scale_color() +
+    geom_jitter(data = 
+                    spp_colour_main %>% 
+                    mutate(traded_wild = case_when(
+                        traded == 1 & SiTDB_wild_caught == 1 ~ 1,
+                        TRUE ~ 0),
+                        traded_captive = case_when(
+                            traded == 1 & SiTDB_wild_caught == 0 ~ 1,
+                            TRUE ~ 0)) %>% 
+                    tidyr::gather(traded_captive,traded_wild,
+                                  key = "trade_type", value = "trade_value") %>% 
+                    mutate(trade_type = factor(trade_type,
+                                               levels = c("traded_captive", "traded_wild"),
+                                               labels = c("Trade of captive-bred individuals (SiTDB)",
+                                                          "Trade of wild-caught individuals (SiTDB)"))), 
+                aes(x = CU_c_spMax, 
+                    y = trade_value,
+                    colour = colour_cat),
+                # colour = "grey",
+                size = 1,
+                width = 0, 
+                height = 0.01, 
+                alpha = 0.5) +
+    scale_colour_manual(values = pal, guide = FALSE)+
+    theme_bw() +
+    theme(panel.grid = element_blank(),
+          axis.text = element_text(size = text_size, 
+                                   colour = "black"),
+          axis.title = element_text(size = title_size),
+          strip.text = element_text(size = lab_size),
+          legend.position = "none") +
+    scale_y_continuous(breaks = seq(0,1,0.1),
+                       labels = seq(0,100,10))
+
+## Combine ---------------------------------------------------------------------
+plot_grid(p_domesticInter,
+          p_wildCaptive,
+          nrow = 2)
+```
