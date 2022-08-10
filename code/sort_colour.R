@@ -92,6 +92,14 @@ colour <-
                                           "violet",
                                           "magenta",
                                           "rose")),
+           # Broader IUCN classification
+           iucn_broad = 
+               case_when(iucn %in% c("LC", "NT") ~ "low_risk",
+                         iucn %in% c("VU", "EN", "CR", 
+                                     # Possibly extinct in the wild
+                                     "CR (PEW)", 
+                                     # Possibly extinct
+                                     "CR (PE)") ~ "high_risk"),
            iucn = factor(iucn,
                          levels = c("LC", "NT", 
                                     "VU", "EN", "CR", 

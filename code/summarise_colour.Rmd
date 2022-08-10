@@ -554,17 +554,6 @@ community_colour <-
         message(x)
         return(NA)
       })})
-# Repeat for traded species only
-community_colour_trade <-
-  # Apply function to every row
-  apply(occ, MARGIN = 1, FUN = function(x){
-    tryCatch(
-      {summarise_cell(range_dat = x,
-                      colour_dat = filter(spp_colour_sub, SiTDB_trade_interest == "evidence"))},
-      error = function(x){
-        message(x)
-        return(NA)
-      })})
 
 # Summarise
 community_colour <-
@@ -580,23 +569,9 @@ community_colour <-
   # Split coordinates variable
   separate(coords, into = c("longitude", "latitude"),
            sep = "_", remove = FALSE, convert = TRUE)
-community_colour_trade <-
-  community_colour_trade %>%
-  # Bind list to df
-  bind_rows(.id = "coords") %>%
-  # Drop any NAs
-  filter(!(is.na(red_mean)) & !(is.na(green_mean)) & !(is.na(blue_mean))) %>%
-  # Calculate hex of mean RGB
-  mutate(hex = rgb(red_mean / 255,
-                   green_mean / 255,
-                   blue_mean / 255)) %>%
-  # Split coordinates variable
-  separate(coords, into = c("longitude", "latitude"),
-           sep = "_", remove = FALSE, convert = TRUE)
 
 # Save
 saveRDS(community_colour, file = "data/sorted/summarise-colour/community_colour.Rds")
-saveRDS(community_colour_trade, file = "data/sorted/summarise-colour/community_colour_trade.Rds")
 ```
 
 ```{r colour-diversity-current, eval = FALSE}
@@ -769,7 +744,6 @@ saveRDS(colour_diversity, file = "data/sorted/summarise-colour/colour_diversity.
 
 ```{r write}
 community_colour <- readRDS("data/sorted/summarise-colour/community_colour.Rds")
-community_colour_trade <- readRDS("data/sorted/summarise-colour/community_colour_trade.Rds")
 colour_diversity <- readRDS("data/sorted/summarise-colour/colour_diversity.Rds")
 envdat <- readRDS("data/raw/envdat.Rds")
 
@@ -777,20 +751,13 @@ envdat <- readRDS("data/raw/envdat.Rds")
 community_colour <-
   left_join(community_colour, colour_diversity, 
             by = c("longitude", "latitude", "patch"))
-community_colour_trade <-
-  left_join(community_colour_trade, colour_diversity, 
-            by = c("longitude", "latitude", "patch"))
 
 # Combine with environmental data
 community_colour <-
   left_join(community_colour, select(envdat, -coords), 
             by = c("longitude", "latitude"))
-community_colour_trade <-
-  left_join(community_colour_trade, select(envdat, -coords), 
-            by = c("longitude", "latitude"))
 
 # Save
 saveRDS(community_colour, file = "data/sorted/summarise-colour/community_colour.Rds")
-saveRDS(community_colour_trade, file = "data/sorted/summarise-colour/community_colour_trade.Rds")
 ```
 

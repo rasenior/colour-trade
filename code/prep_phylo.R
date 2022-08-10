@@ -20,22 +20,21 @@ simpleCap <- function(x) {
 colourpal <- readRDS("data/misc/colourpal_mute.Rds")
 birds_tree <- readRDS("data/raw/phy.Rds")
 spp_colour <- 
-    readRDS("data/sorted/summarise-colour/spp_colour.Rds") %>% 
+    readRDS("data/sorted/summarise-colour/spp_colour.Rds") %>%
     filter(
         patch == "crown",
         # Remove species with NA threat or trade status
         !(is.na(traded)),
-        !(is.na(iucn)),
+        !(is.na(iucn_broad)),
         !(is.na(CU_c_spMax))
     ) %>% 
     mutate(species = gsub("[.]", "_", species),
            traded = factor(traded,
                            levels = c("no", "yes"),
                            labels = c("not-traded", "traded")),
-           threat = factor(iucn,
-                           levels = c("LC", "NT", "VU", "EN", "CR"),
-                           labels = c(rep("not-threatened",2), 
-                                      rep("threatened",3))),
+           threat = factor(iucn_broad,
+                           levels = c("low_risk", "high_risk"),
+                           labels = c("not-threatened", "threatened")),
            threat_trade =
                factor(
                    case_when(traded == "traded" & threat == "threatened" ~ 
@@ -63,6 +62,20 @@ spp_colour <-
 
 # Get density values for histogram
 unique_density <- density(spp_colour$CU_c_spMax)
+
+# Threatened + traded = red
+# Threatened = orange
+# Traded = yellow
+# Not threatened, not traded = blue
+
+# High uniqueness = red
+# Med-high uniqueness = orange
+# Low-med uniqueness = yellow
+# Low uniqueness = blue
+
+# levels(birds_tree$tip.state$uniqueness_global_spMax) <- c("low","lowmed","medhigh","high")
+# colouruniqpal <- rev(c("#a50026", "#f46d43", "#fee090", "#e0f3f8"))
+# names(colouruniqpal)   <- c("low","lowmed","medhigh","high")
 
 # Get the hex value for each colour category
 spp_colour$cat_hex <- 
